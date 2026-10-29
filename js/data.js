@@ -10,6 +10,43 @@ export const GOALS = [
   { id: 'family',   emoji: '👨‍👩‍👧', label: 'Family friendly',    hint: 'Crowd-pleasers for all ages' },
 ];
 
+// The main staple a meal is built around. `fetch` = TheMealDB ingredient names used to find more recipes.
+export const BASES = [
+  { id: 'pasta',   emoji: '🍝', label: 'Pasta',          fetch: ['spaghetti', 'penne_rigate', 'macaroni', 'lasagne_sheets', 'farfalle'] },
+  { id: 'rice',    emoji: '🍚', label: 'Rice',           fetch: ['rice', 'basmati_rice'] },
+  { id: 'potato',  emoji: '🥔', label: 'Potatoes',       fetch: ['potatoes'] },
+  { id: 'noodles', emoji: '🍜', label: 'Noodles',        fetch: ['rice_noodles', 'noodles', 'egg_noodles'] },
+  { id: 'bread',   emoji: '🌯', label: 'Bread & wraps',  fetch: ['bread', 'tortillas', 'puff_pastry'] },
+  { id: 'grains',  emoji: '🌾', label: 'Couscous & grains', fetch: ['couscous', 'quinoa'] },
+  { id: 'none',    emoji: '🥘', label: 'Soups, stews & curries', fetch: [] },
+];
+
+// Quick picks for the "I like" / "I don't like" lists. `match` = words found in ingredient names.
+export const FOODS = [
+  { id: 'chicken',   label: 'Chicken',      match: ['chicken'] },
+  { id: 'beef',      label: 'Beef',         match: ['beef', 'steak'] },
+  { id: 'pork',      label: 'Pork & bacon', match: ['pork', 'bacon', 'ham', 'sausage', 'chorizo'] },
+  { id: 'lamb',      label: 'Lamb',         match: ['lamb'] },
+  { id: 'fish',      label: 'Fish',         match: ['fish', 'salmon', 'cod', 'tuna', 'haddock', 'hake'] },
+  { id: 'prawn',     label: 'Prawns',       match: ['prawn', 'shrimp'] },
+  { id: 'egg',       label: 'Eggs',         match: ['egg'] },
+  { id: 'cheese',    label: 'Cheese',       match: ['cheese', 'cheddar', 'mozzarella', 'feta', 'parmesan', 'halloumi', 'pecorino'] },
+  { id: 'mushroom',  label: 'Mushrooms',    match: ['mushroom'] },
+  { id: 'spinach',   label: 'Spinach',      match: ['spinach'] },
+  { id: 'broccoli',  label: 'Broccoli',     match: ['broccoli'] },
+  { id: 'peppers',   label: 'Peppers',      match: ['red pepper', 'green pepper', 'yellow pepper', 'bell pepper'] },
+  { id: 'aubergine', label: 'Aubergine',    match: ['aubergine'] },
+  { id: 'beans',     label: 'Beans',        match: ['beans'] },
+  { id: 'chickpeas', label: 'Chickpeas',    match: ['chickpea'] },
+  { id: 'lentils',   label: 'Lentils',      match: ['lentil'] },
+  { id: 'avocado',   label: 'Avocado',      match: ['avocado'] },
+  { id: 'chilli',    label: 'Spicy food',   match: ['chilli', 'jalapeno', 'cayenne', 'scotch bonnet'] },
+  { id: 'coriander', label: 'Coriander',    match: ['coriander', 'cilantro'] },
+  { id: 'olives',    label: 'Olives',       match: ['olive'] },
+  { id: 'coconut',   label: 'Coconut',      match: ['coconut'] },
+  { id: 'tofu',      label: 'Tofu',         match: ['tofu'] },
+];
+
 export const ALLERGENS = [
   { id: 'gluten',    label: 'Gluten' },
   { id: 'dairy',     label: 'Dairy' },
@@ -50,13 +87,14 @@ export const CATEGORIES = [
   { id: 'staple', label: 'Check you have',       emoji: '🧂' },
 ];
 
-// Chain stores that items can be flagged with. Prices will come from
-// BasketWatch Ireland later (see README).
+// Chain stores that items can be flagged with. Prices come from BasketWatch Ireland (see prices.js);
+// `osm` matches the brand tag on OpenStreetMap for the shop finder (see shops.js).
 export const STORES = [
   { id: '',          label: 'Any shop',  short: 'Any',   color: '#8a948c' },
-  { id: 'tesco',     label: 'Tesco',     short: 'Tesco', color: '#00539f' },
-  { id: 'dunnes',    label: 'Dunnes Stores', short: 'Dunnes', color: '#1d1d1b' },
-  { id: 'supervalu', label: 'SuperValu', short: 'SuperValu', color: '#d6001c' },
-  { id: 'aldi',      label: 'Aldi',      short: 'Aldi',  color: '#001e78' },
-  { id: 'lidl',      label: 'Lidl',      short: 'Lidl',  color: '#0050aa' },
+  { id: 'tesco',     label: 'Tesco',     short: 'Tesco', color: '#00539f', osm: /tesco/i },
+  { id: 'dunnes',    label: 'Dunnes Stores', short: 'Dunnes', color: '#1d1d1b', osm: /dunnes/i },
+  { id: 'supervalu', label: 'SuperValu', short: 'SuperValu', color: '#d6001c', osm: /supervalu/i },
+  { id: 'aldi',      label: 'Aldi',      short: 'Aldi',  color: '#001e78', osm: /aldi/i },
+  { id: 'lidl',      label: 'Lidl',      short: 'Lidl',  color: '#0050aa', osm: /lidl/i },
 ];
+export const CHAINS = STORES.filter((s) => s.id);

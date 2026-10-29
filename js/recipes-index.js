@@ -8,6 +8,8 @@ const fetched = new Map(); // TheMealDB recipes loaded this session
 
 export const addFetched = (recipes) => recipes.forEach((r) => fetched.set(r.id, r));
 
+export const isBuiltIn = (id) => builtIn.has(id);
+
 export const getRecipe = (id) => builtIn.get(id) || state.extRecipes[id] || fetched.get(id);
 
 export const allCandidates = () => {

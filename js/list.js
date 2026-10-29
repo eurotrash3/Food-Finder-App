@@ -52,10 +52,11 @@ export function buildList() {
   }
   const items = [...map.values()].map((e) => {
     const parts = Object.entries(e.amounts).map(([unit, q]) => formatAmount(roundQty(q, unit), unit));
-    return { ...e, amount: [...parts, ...e.notes].filter(Boolean).join(' + '), custom: false };
+    const needGrams = Math.round((e.amounts.g || 0) + (e.amounts.ml || 0)) || null; // helps pick a big enough pack
+    return { ...e, amount: [...parts, ...e.notes].filter(Boolean).join(' + '), needGrams, custom: false };
   });
   for (const c of state.custom) {
-    items.push({ key: `custom:${c.id}`, id: c.id, name: c.name, cat: 'other', amount: '', from: [], custom: true });
+    items.push({ key: `custom:${c.id}`, id: c.id, name: c.name, cat: 'other', amount: '', from: [], needGrams: null, custom: true });
   }
   for (const it of items) {
     const o = state.items[it.key] || {};

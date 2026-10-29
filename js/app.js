@@ -1,8 +1,11 @@
-import { GOALS, ALLERGENS, DIETS, TIMES, CATEGORIES, STORES } from './data.js';
+import { GOALS, BASES, FOODS, ALLERGENS, DIETS, TIMES, CATEGORIES, STORES, CHAINS } from './data.js';
 import { state, save, startNewWeek, resetAll } from './store.js';
-import { getRecipe, allCandidates, addFetched } from './recipes-index.js';
-import { fetchRandomRecipes } from './mealdb.js';
+import { getRecipe, allCandidates, addFetched, isBuiltIn } from './recipes-index.js';
+import { fetchRandomRecipes, fetchByIngredient, normalizeName } from './mealdb.js';
 import { buildList, sharedIngredients, portionsFor, scaledIngredient, normName } from './list.js';
+import { pricesEnabled, comparePrices, cachedPrices, cachedBrands, clearPriceCache, summarize, cheapestStore,
+  searchBrands, brandSaving } from './prices.js';
+import { currentPosition, geocode, findShops, directionsUrl, formatKm, loadLeaflet } from './shops.js';
 import * as sync from './sync.js';
 
 const view = document.getElementById('view');
@@ -14,13 +17,15 @@ const steps = document.getElementById('steps');
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const go = (route) => { location.hash = `#/${route}`; };
 const euro = (cost) => (cost ? '€'.repeat(cost) : '');
+const money = (n) => `€${n.toFixed(2)}`;
+const storeOf = (id) => STORES.find((s) => s.id === id) || STORES[0];
 
 function toast(msg) {
   const el = document.getElementById('toast');
   el.textContent = msg;
   el.classList.add('show');
   clearTimeout(toast.t);
-  toast.t = setTimeout(() => el.classList.remove('show'), 2200);
+  toast.t = setTimeout(() => el.classList.remove('show'), 2400);
 }
 
 function toggleIn(arr, value) {
@@ -29,10 +34,30 @@ function toggleIn(arr, value) {
 }
 
 function recipeArt(r, cls = '') {
-  return r.image
-    ? `<div class="art ${cls}" style="background:${esc(r.color)}"><img src="${esc(r.image)}" alt="" loading="lazy" draggable="false"></div>`
-    : `<div class="art ${cls}" style="background:linear-gradient(135deg, ${esc(r.color)}, ${esc(r.color)}99)"><span>${r.emoji}</span></div>`;
+  if (!r.image) return `<div class="art ${cls}" style="background:${esc(r.color || '#adc178')}"><span>${r.emoji || '🍽️'}</span></div>`;
+  const src = cls === 'thumb' ? `${r.image}/preview` : r.image;
+  return `<div class="art ${cls}"><img src="${esc(src)}" alt="" loading="lazy" draggable="false"></div>`;
 }
+
+// ---------- food matching (likes, dislikes, kitchen) ----------
+
+const foodLabel = (term) => FOODS.find((f) => f.id === term)?.label || term;
+const foodWords = (term) => FOODS.find((f) => f.id === term)?.match || [normalizeName(term)].filter(Boolean);
+const ingredientNames = (r) => [...new Set(r.ingredients.filter((i) => i.cat !== 'staple').map((i) => normName(i.name)))];
+
+// Ingredient names in recipe `r` that match a liked/disliked/kitchen term.
+function matching(r, term) {
+  const words = foodWords(term);
+  return ingredientNames(r).filter((n) => words.some((w) => n.includes(w)));
+}
+
+function kitchenMatches(r, list) {
+  const hits = new Set();
+  for (const term of list) matching(r, term).forEach((n) => hits.add(n));
+  return [...hits];
+}
+
+const inKitchen = (name) => [...state.pantry.useUp, ...state.pantry.have].some((t) => foodWords(t).some((w) => name.includes(w)));
 
 // ---------- recipe matching ----------
 
@@ -44,77 +69,80 @@ function allowed(r) {
   if (d.includes('pescatarian') && r.diet === 'meat') return false;
   if (d.includes('nopork') && r.pork) return false;
   if (state.maxTime && r.time && r.time > state.maxTime) return false;
-  const dislikes = state.dislikes.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-  const text = (r.title + ' ' + r.ingredients.map((x) => x.name).join(' ')).toLowerCase();
-  if (dislikes.some((w) => text.includes(w))) return false;
+  if (state.bases.length && !state.bases.includes(r.base)) return false;
+  if (state.dislikes.some((t) => matching(r, t).length || r.title.toLowerCase().includes(foodLabel(t).toLowerCase()))) return false;
   return true;
 }
 
 const jitter = new Map();
 const rand = (id) => { if (!jitter.has(id)) jitter.set(id, Math.random()); return jitter.get(id); };
 
-// Ingredients already on the list (excluding staples) that this recipe would reuse.
-function overlapWithPicked(r) {
-  const picked = new Set();
+function plannedNames() {
+  const names = new Set();
   for (const id of state.liked) {
     const p = getRecipe(id);
-    p?.ingredients.forEach((x) => x.cat !== 'staple' && picked.add(normName(x.name)));
+    if (p) ingredientNames(p).forEach((n) => names.add(n));
   }
-  return r.ingredients.filter((x) => x.cat !== 'staple' && picked.has(normName(x.name))).map((x) => x.name);
+  return names;
 }
 
-function score(r) {
-  const g = state.goals;
-  let s = rand(r.id) * 3;
-  for (const goal of g) if (r.tags.includes(goal)) s += 3;
-  if (g.includes('money') && r.cost === 1) s += 2;
-  if (g.includes('quick') && r.time && r.time <= 30) s += 2;
-  if (r.source) s += 1.5; // keep TheMealDB cards mixed in with the built-ins
-  s += overlapWithPicked(r).length * (g.includes('waste') ? 2 : 1);
+// How a recipe fits the week: what it reuses, what's new to buy, what it uses up.
+function fit(r, planned = plannedNames()) {
+  const names = ingredientNames(r);
+  const fromPlan = names.filter((n) => planned.has(n));
+  const useUp = kitchenMatches(r, state.pantry.useUp);
+  const have = kitchenMatches(r, state.pantry.have).filter((n) => !useUp.includes(n));
+  const owned = new Set([...fromPlan, ...useUp, ...have]);
+  const toBuy = names.filter((n) => !owned.has(n));
+  const liked = state.likes.filter((t) => matching(r, t).length);
+  return { fromPlan, useUp, have, toBuy, liked };
+}
+
+// Ranking is tuned to save money and food: reuse what you're already buying or already have,
+// use up food that's going off, and keep the number of new things to buy low.
+function score(r, planned) {
+  const f = fit(r, planned);
+  let s = rand(r.id) * 1.5;
+  for (const goal of state.goals) if (r.tags.includes(goal)) s += 2;
+  s += f.fromPlan.length * 4 + f.have.length * 3 + f.useUp.length * 8 + f.liked.length * 5;
+  s -= f.toBuy.length * 1.5;
+  s += (3 - (r.cost || 2)) * (state.goals.includes('money') ? 2.5 : 1.5);
+  if (state.goals.includes('quick') && r.time <= 30) s += 2;
   return s;
 }
 
 function deck() {
   const seen = new Set([...state.liked, ...state.passed]);
-  return allCandidates().filter((r) => !seen.has(r.id) && allowed(r)).sort((a, b) => score(b) - score(a));
+  const planned = plannedNames();
+  return allCandidates()
+    .filter((r) => !seen.has(r.id) && allowed(r))
+    .map((r) => ({ r, s: score(r, planned) }))
+    .sort((a, b) => b.s - a.s)
+    .map((x) => x.r);
 }
 
+// Pull extra TheMealDB recipes that match what you like, have, or want as a base.
 let fetching = false;
 async function topUpFromMealDb(force = false) {
   if (fetching || !navigator.onLine) return;
-  if (!force && deck().filter((r) => r.source).length >= 4) return;
+  if (!force && deck().length >= 8) return;
   fetching = true;
+  const terms = [
+    ...state.pantry.useUp, ...state.likes, ...state.pantry.have.slice(0, 5),
+    ...BASES.filter((b) => state.bases.includes(b.id)).flatMap((b) => b.fetch),
+  ].map((t) => (FOODS.find((f) => f.id === t)?.match[0]) || normalizeName(t)).filter(Boolean);
   try {
-    addFetched(await fetchRandomRecipes(10));
-  } catch { /* offline or API down - built-ins still work */ }
+    const skip = new Set(allCandidates().map((r) => r.id));
+    const term = terms[Math.floor(Math.random() * terms.length)];
+    let found = term ? await fetchByIngredient(term, { limit: 8, skip }) : [];
+    if (found.length < 3) found = found.concat(await fetchRandomRecipes(8));
+    addFetched(found);
+  } catch { /* offline or API busy - built-ins still work */ }
   fetching = false;
   if (currentRoute() === 'swipe' && !dragging) render();
 }
 
-// ---------- onboarding screens ----------
-
-function goalsScreen() {
-  view.innerHTML = `
-    <section class="screen">
-      <h1>What are you hoping to do this week?</h1>
-      <p class="sub">Pick as many as you like. We'll use them to suggest recipes.</p>
-      <div class="option-grid">
-        ${GOALS.map((g) => `
-          <button class="option ${state.goals.includes(g.id) ? 'on' : ''}" data-goal="${g.id}">
-            <span class="option-emoji">${g.emoji}</span>
-            <span class="option-label">${g.label}</span>
-            <span class="option-hint">${g.hint}</span>
-          </button>`).join('')}
-      </div>
-      <div class="actions"><button class="btn primary big" id="next">Next</button></div>
-    </section>`;
-  view.querySelectorAll('[data-goal]').forEach((b) => b.addEventListener('click', () => {
-    toggleIn(state.goals, b.dataset.goal);
-    b.classList.toggle('on');
-    save();
-  }));
-  view.querySelector('#next').addEventListener('click', () => go('cook'));
-}
+// ---------- shared form bits ----------
 
 function stepper(id, value, min, max) {
   return `<div class="stepper" data-stepper="${id}" data-min="${min}" data-max="${max}">
@@ -137,6 +165,66 @@ function bindSteppers(onChange) {
   });
 }
 
+// A list of removable food chips, an "add your own" box and quick-pick suggestions.
+// `get()` returns the array to edit; `cls` colours the chips.
+function foodPicker(id, items, suggestions, { placeholder, cls = 'on' }) {
+  const extra = items.filter((t) => !suggestions.some((s) => s.id === t));
+  return `
+    <div class="food-picker" data-picker="${id}">
+      <div class="chips">
+        ${suggestions.map((s) => `<button class="chip ${items.includes(s.id) ? cls : ''}" data-food="${esc(s.id)}">${esc(s.label)}</button>`).join('')}
+        ${extra.map((t) => `<button class="chip ${cls}" data-food="${esc(t)}">${esc(t)} ✕</button>`).join('')}
+      </div>
+      <form class="add-item small" data-add="${id}">
+        <input class="input" name="food" placeholder="${esc(placeholder)}" autocomplete="off">
+        <button class="btn" type="submit">Add</button>
+      </form>
+    </div>`;
+}
+
+function bindFoodPicker(id, getList, rerender, { exclusive } = {}) {
+  const root = view.querySelector(`[data-picker="${id}"]`);
+  root.querySelectorAll('[data-food]').forEach((b) => b.addEventListener('click', () => {
+    const list = getList();
+    toggleIn(list, b.dataset.food);
+    if (exclusive) { const other = exclusive(); const i = other.indexOf(b.dataset.food); if (i >= 0) other.splice(i, 1); }
+    save(); rerender();
+  }));
+  root.querySelector('form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const list = getList();
+    for (const raw of e.target.food.value.split(',')) {
+      const t = raw.trim().toLowerCase();
+      if (t && !list.includes(t)) list.push(t);
+    }
+    save(); rerender();
+    view.querySelector(`[data-add="${id}"] input`)?.focus();
+  });
+}
+
+// ---------- onboarding: goals → cooking → base → limits → kitchen ----------
+
+function goalsScreen() {
+  view.innerHTML = `
+    <section class="screen">
+      <h1>What are you hoping to do this week?</h1>
+      <p class="sub">Pick as many as you like. Recipes that reuse ingredients are always ranked first, to save money and food.</p>
+      <div class="option-grid">
+        ${GOALS.map((g) => `
+          <button class="option ${state.goals.includes(g.id) ? 'on' : ''}" data-goal="${g.id}">
+            <span class="option-emoji">${g.emoji}</span>
+            <span class="option-label">${g.label}</span>
+            <span class="option-hint">${g.hint}</span>
+          </button>`).join('')}
+      </div>
+      <div class="actions"><button class="btn primary big" id="next">Next</button></div>
+    </section>`;
+  view.querySelectorAll('[data-goal]').forEach((b) => b.addEventListener('click', () => {
+    toggleIn(state.goals, b.dataset.goal); b.classList.toggle('on'); save();
+  }));
+  view.querySelector('#next').addEventListener('click', () => go('cook'));
+}
+
 function cookScreen() {
   view.innerHTML = `
     <section class="screen">
@@ -156,10 +244,33 @@ function cookScreen() {
       </div>
     </section>`;
   bindSteppers((key) => key === 'cookCount' && cookScreen());
-  view.querySelectorAll('[data-n]').forEach((b) => b.addEventListener('click', () => {
-    state.cookCount = +b.dataset.n; save(); cookScreen();
-  }));
+  view.querySelectorAll('[data-n]').forEach((b) => b.addEventListener('click', () => { state.cookCount = +b.dataset.n; save(); cookScreen(); }));
   view.querySelector('#back').addEventListener('click', () => go('goals'));
+  view.querySelector('#next').addEventListener('click', () => go('base'));
+}
+
+function baseScreen() {
+  view.innerHTML = `
+    <section class="screen">
+      <h1>What do you want your meals built around?</h1>
+      <p class="sub">Pick one or more main staples, or leave them all off for anything. Sticking to one or two staples means fewer half-used packets.</p>
+      <div class="option-grid">
+        ${BASES.map((b) => `
+          <button class="option ${state.bases.includes(b.id) ? 'on' : ''}" data-base="${b.id}">
+            <span class="option-emoji">${b.emoji}</span>
+            <span class="option-label">${b.label}</span>
+          </button>`).join('')}
+      </div>
+      <p class="hint">${state.bases.length ? '' : 'Nothing picked, so you\'ll see every kind of meal.'}</p>
+      <div class="actions">
+        <button class="btn ghost" id="back">Back</button>
+        <button class="btn primary big" id="next">Next</button>
+      </div>
+    </section>`;
+  view.querySelectorAll('[data-base]').forEach((b) => b.addEventListener('click', () => {
+    toggleIn(state.bases, b.dataset.base); save(); baseScreen();
+  }));
+  view.querySelector('#back').addEventListener('click', () => go('cook'));
   view.querySelector('#next').addEventListener('click', () => go('limits'));
 }
 
@@ -167,11 +278,15 @@ function limitsScreen() {
   view.innerHTML = `
     <section class="screen">
       <h1>Any limitations or allergies?</h1>
-      <p class="sub">We'll hide any recipe that doesn't fit.</p>
+      <p class="sub">We'll hide any recipe that doesn't fit, and look for ones with food you love.</p>
       <h2>Allergies &amp; intolerances</h2>
       <div class="chips">
         ${ALLERGENS.map((a) => `<button class="chip ${state.allergies.includes(a.id) ? 'on warn' : ''}" data-allergy="${a.id}">${a.label}</button>`).join('')}
       </div>
+      <h2>❤️ I like… <small>recipes with these come first</small></h2>
+      ${foodPicker('likes', state.likes, FOODS, { placeholder: 'Add a food you love, e.g. halloumi' })}
+      <h2>👎 I don't like… <small>recipes with these are hidden</small></h2>
+      ${foodPicker('dislikes', state.dislikes, FOODS, { placeholder: 'Add a food you don\'t eat, e.g. olives', cls: 'on warn' })}
       <h2>Diet</h2>
       <div class="chips">
         ${DIETS.map((d) => `<button class="chip ${state.diets.includes(d.id) ? 'on' : ''}" data-diet="${d.id}">${d.label}</button>`).join('')}
@@ -180,25 +295,59 @@ function limitsScreen() {
       <div class="chips">
         ${TIMES.map((t) => `<button class="chip ${state.maxTime === t.value ? 'on' : ''}" data-time="${t.value}">${t.label}</button>`).join('')}
       </div>
-      <h2>Foods you don't like</h2>
-      <input class="input" id="dislikes" placeholder="e.g. mushrooms, coriander, olives" value="${esc(state.dislikes)}">
-      <p class="hint">Separate with commas.</p>
       <div class="actions">
         <button class="btn ghost" id="back">Back</button>
-        <button class="btn primary big" id="next">Start swiping 🔥</button>
+        <button class="btn primary big" id="next">Next</button>
       </div>
     </section>`;
+  const keepScroll = () => { const y = window.scrollY; limitsScreen(); window.scrollTo(0, y); };
   view.querySelectorAll('[data-allergy]').forEach((b) => b.addEventListener('click', () => {
-    toggleIn(state.allergies, b.dataset.allergy); b.classList.toggle('on'); b.classList.toggle('warn'); save();
+    toggleIn(state.allergies, b.dataset.allergy); save(); keepScroll();
   }));
-  view.querySelectorAll('[data-diet]').forEach((b) => b.addEventListener('click', () => {
-    toggleIn(state.diets, b.dataset.diet); b.classList.toggle('on'); save();
-  }));
-  view.querySelectorAll('[data-time]').forEach((b) => b.addEventListener('click', () => {
-    state.maxTime = +b.dataset.time; save(); limitsScreen();
-  }));
-  view.querySelector('#dislikes').addEventListener('input', (e) => { state.dislikes = e.target.value; save(); });
-  view.querySelector('#back').addEventListener('click', () => go('cook'));
+  bindFoodPicker('likes', () => state.likes, keepScroll, { exclusive: () => state.dislikes });
+  bindFoodPicker('dislikes', () => state.dislikes, keepScroll, { exclusive: () => state.likes });
+  view.querySelectorAll('[data-diet]').forEach((b) => b.addEventListener('click', () => { toggleIn(state.diets, b.dataset.diet); save(); keepScroll(); }));
+  view.querySelectorAll('[data-time]').forEach((b) => b.addEventListener('click', () => { state.maxTime = +b.dataset.time; save(); keepScroll(); }));
+  view.querySelector('#back').addEventListener('click', () => go('base'));
+  view.querySelector('#next').addEventListener('click', () => go('kitchen'));
+}
+
+// ---------- my kitchen (current groceries) ----------
+
+const USE_UP_SUGGESTIONS = ['spinach', 'mushroom', 'peppers', 'broccoli', 'carrot', 'potato', 'tomato', 'courgette', 'chicken',
+  'minced beef', 'egg', 'milk', 'cream', 'cheese', 'lemon', 'coriander', 'banana', 'bread'].map((x) => ({ id: x, label: foodLabel(x) }));
+const HAVE_SUGGESTIONS = ['rice', 'pasta', 'spaghetti', 'potato', 'onion', 'garlic', 'egg', 'milk', 'butter', 'cheddar', 'plain flour',
+  'chopped tomatoes', 'tomato purée', 'chicken stock', 'vegetable stock', 'soy sauce', 'coconut milk', 'kidney beans', 'chickpeas',
+  'frozen peas', 'paprika', 'cumin', 'curry powder', 'honey', 'sugar'].map((x) => ({ id: x, label: x }));
+
+function kitchenScreen() {
+  const onboarding = !state.onboarded;
+  view.innerHTML = `
+    <section class="screen">
+      <h1>${onboarding ? 'What\'s in your kitchen?' : 'My kitchen'}</h1>
+      <p class="sub">Recipes that use what you already have are shown first, and anything you have is taken off your shopping list.</p>
+      <div class="card-block kitchen-card useup">
+        <h2>⏰ Use these up <small>${state.pantry.useUp.length}</small></h2>
+        <p class="hint">Food that needs using soon. Recipes that use it get the biggest boost.</p>
+        ${foodPicker('useUp', state.pantry.useUp, USE_UP_SUGGESTIONS, { placeholder: 'e.g. half a bag of spinach', cls: 'on amber' })}
+      </div>
+      <div class="card-block kitchen-card">
+        <h2>🧊 Everything I have <small>${state.pantry.have.length}</small></h2>
+        <p class="hint">What's already in your fridge, freezer and cupboards. Add several at once, separated by commas.</p>
+        ${foodPicker('have', state.pantry.have, HAVE_SUGGESTIONS, { placeholder: 'e.g. rice, onions, chopped tomatoes' })}
+      </div>
+      <div class="actions">
+        ${onboarding ? '<button class="btn ghost" id="back">Back</button>' : '<button class="btn ghost" id="clear">Clear both lists</button>'}
+        <button class="btn primary big" id="next">${onboarding ? 'Start swiping 🔥' : 'Find recipes that use these'}</button>
+      </div>
+    </section>`;
+  const keepScroll = () => { const y = window.scrollY; kitchenScreen(); window.scrollTo(0, y); };
+  bindFoodPicker('useUp', () => state.pantry.useUp, keepScroll);
+  bindFoodPicker('have', () => state.pantry.have, keepScroll);
+  view.querySelector('#back')?.addEventListener('click', () => go('limits'));
+  view.querySelector('#clear')?.addEventListener('click', () => {
+    if (confirm('Empty both kitchen lists?')) { state.pantry = { useUp: [], have: [] }; save(); kitchenScreen(); }
+  });
   view.querySelector('#next').addEventListener('click', () => { state.onboarded = true; save(); go('swipe'); });
 }
 
@@ -206,34 +355,42 @@ function limitsScreen() {
 
 let dragging = false;
 
-function cardHtml(r, top) {
-  const overlap = overlapWithPicked(r);
+function cardHtml(r, top, planned) {
+  const f = fit(r, planned);
   const meta = [
-    r.time ? `⏱ ${r.time} min` : '',
+    r.time ? `⏱ ~${r.time} min` : '',
     r.cost ? `<span class="cost">${euro(r.cost)}</span>` : '',
     r.diet !== 'meat' ? `🌱 ${r.diet}` : '',
   ].filter(Boolean);
-  const goalTags = GOALS.filter((g) => r.tags.includes(g.id)).slice(0, 3);
+  const base = BASES.find((b) => b.id === r.base);
+  const goalTags = GOALS.filter((g) => r.tags.includes(g.id)).slice(0, 2);
+  const badges = [
+    f.useUp.length ? `<div class="badge useup">⏰ Uses up your ${esc(f.useUp.slice(0, 3).join(', '))}</div>` : '',
+    f.have.length ? `<div class="badge have">🧊 Uses ${f.have.length} thing${f.have.length > 1 ? 's' : ''} you have: ${esc(f.have.slice(0, 3).join(', '))}</div>` : '',
+    f.fromPlan.length ? `<div class="badge reuse">♻️ Reuses ${f.fromPlan.length} from your week: ${esc(f.fromPlan.slice(0, 3).join(', '))}</div>` : '',
+    f.liked.length ? `<div class="badge like">❤️ Has ${esc(f.liked.map(foodLabel).join(', '))}</div>` : '',
+  ].filter(Boolean).slice(0, 2);
   return `
     <article class="swipe-card ${top ? 'top' : 'next'}" data-id="${esc(r.id)}">
       ${recipeArt(r)}
       <div class="stamp like">YUM</div>
       <div class="stamp nope">NOPE</div>
+      <div class="buy-count" title="New things to buy">🛒 ${f.toBuy.length} new to buy</div>
       <div class="card-body">
         <h2>${esc(r.title)}</h2>
-        <p>${esc(r.desc)}</p>
         <div class="meta">${meta.map((m) => `<span>${m}</span>`).join('')}</div>
         <div class="tags">
+          ${base && base.id !== 'none' ? `<span class="tag">${base.emoji} ${base.label}</span>` : ''}
           ${goalTags.map((g) => `<span class="tag">${g.emoji} ${g.label}</span>`).join('')}
-          ${r.source ? '<span class="tag muted">TheMealDB</span>' : ''}
         </div>
-        ${overlap.length ? `<div class="overlap">♻️ Reuses ${overlap.length} ingredient${overlap.length > 1 ? 's' : ''} from your plan: ${esc(overlap.slice(0, 3).join(', '))}</div>` : ''}
+        ${badges.join('')}
       </div>
     </article>`;
 }
 
 function swipeScreen() {
   const cards = deck();
+  const planned = plannedNames();
   const picked = state.liked.length;
   const target = state.cookCount;
   view.innerHTML = `
@@ -244,11 +401,11 @@ function swipeScreen() {
       </div>
       <div class="deck">
         ${cards.length
-          ? cards.slice(0, 2).reverse().map((r, idx, arr) => cardHtml(r, idx === arr.length - 1)).join('')
+          ? cards.slice(0, 2).reverse().map((r, idx, arr) => cardHtml(r, idx === arr.length - 1, planned)).join('')
           : `<div class="empty">
               <div class="big-emoji">🍽️</div>
-              <h2>You've seen every recipe</h2>
-              <p>Load more from TheMealDB, or loosen your filters in Settings.</p>
+              <h2>${fetching ? 'Finding more recipes…' : 'You\'ve seen every matching recipe'}</h2>
+              <p>Load more, or loosen your staples, likes and limits in Settings.</p>
               <button class="btn primary" id="more">Load more recipes</button>
               ${state.passed.length ? '<button class="btn ghost" id="again">Show recipes I passed on</button>' : ''}
             </div>`}
@@ -265,6 +422,7 @@ function swipeScreen() {
   if (!cards.length) {
     view.querySelector('#more').addEventListener('click', (e) => { e.target.textContent = 'Loading…'; topUpFromMealDb(true); });
     view.querySelector('#again')?.addEventListener('click', () => { state.passed = []; save(); render(); });
+    topUpFromMealDb(true);
     return;
   }
   const top = view.querySelector('.swipe-card.top');
@@ -317,7 +475,7 @@ function decide(id, like) {
   if (!r) return;
   if (like) {
     if (!state.liked.includes(id)) state.liked.push(id);
-    if (r.source) state.extRecipes[id] = r;
+    if (!isBuiltIn(id)) state.extRecipes[id] = r; // keep fetched recipes so they survive a reload
   } else if (!state.passed.includes(id)) {
     state.passed.push(id);
   }
@@ -344,6 +502,13 @@ function showDoneModal() {
 
 // ---------- recipe detail ----------
 
+function ingredientRows(r, factor) {
+  return r.ingredients.map((x) => scaledIngredient(x, factor)).map((x) => {
+    const have = x.cat !== 'staple' && inKitchen(normName(x.name));
+    return `<li class="${have ? 'have' : ''}"><span>${esc(x.name)}${have ? ' <small>✓ in your kitchen</small>' : ''}</span><span class="amt">${esc(x.amount)}</span></li>`;
+  }).join('');
+}
+
 function recipeScreen(id) {
   const r = getRecipe(id);
   if (!r) { go('swipe'); return; }
@@ -356,28 +521,25 @@ function recipeScreen(id) {
       <button class="btn ghost back" id="back">‹ Back</button>
       ${recipeArt(r, 'hero')}
       <h1>${esc(r.title)}</h1>
-      <p class="sub">${esc(r.desc)}</p>
+      ${r.desc ? `<p class="sub">${esc(r.desc)}</p>` : ''}
       <div class="meta">
-        ${r.time ? `<span>⏱ ${r.time} min</span>` : ''}
+        ${r.time ? `<span>⏱ ~${r.time} min</span>` : ''}
         ${r.cost ? `<span class="cost">${euro(r.cost)}</span>` : ''}
         <span>🍽 ${portions} portion${portions > 1 ? 's' : ''}</span>
       </div>
-      ${allergenLabels.length ? `<p class="allergens">⚠️ Contains: ${allergenLabels.join(', ')}${r.source ? ' (auto-detected, so check the labels)' : ''}</p>` : ''}
+      ${allergenLabels.length ? `<p class="allergens">⚠️ May contain: ${allergenLabels.join(', ')}. This is detected automatically, so always check the labels.</p>` : ''}
       <h2>Ingredients</h2>
-      <ul class="ingredients">
-        ${r.ingredients.map((x) => scaledIngredient(x, factor)).map((x) =>
-          `<li><span>${esc(x.name)}</span><span class="amt">${esc(x.amount)}</span></li>`).join('')}
-      </ul>
+      <ul class="ingredients">${ingredientRows(r, factor)}</ul>
       <h2>Method</h2>
       <ol class="method">${r.steps.map((s) => `<li>${esc(s)}</li>`).join('')}</ol>
-      ${r.sourceUrl ? `<p class="hint">Recipe from <a href="${esc(r.sourceUrl)}" target="_blank" rel="noopener">${esc(r.source)}</a></p>` : ''}
+      ${r.sourceUrl ? `<p class="hint">Recipe from <a href="${esc(r.sourceUrl)}" target="_blank" rel="noopener">${esc(r.source)}</a>. Times and costs are estimates.</p>` : ''}
       <div class="actions sticky">
         ${inPlan
           ? '<button class="btn danger" id="toggle">Remove from my week</button>'
           : '<button class="btn primary big" id="toggle">♥ Add to my week</button>'}
       </div>
     </section>`;
-  view.querySelector('#back').addEventListener('click', () => history.length > 1 ? history.back() : go('swipe'));
+  view.querySelector('#back').addEventListener('click', () => (history.length > 1 ? history.back() : go('swipe')));
   view.querySelector('#toggle').addEventListener('click', () => {
     if (inPlan) {
       state.liked = state.liked.filter((x) => x !== id);
@@ -399,13 +561,13 @@ function planScreen() {
     <section class="screen">
       <h1>My week</h1>
       <p class="sub">${recipes.length} of ${state.cookCount} meals picked · cooking for ${state.people}</p>
-      ${shared.length ? `<div class="overlap block">♻️ <strong>${shared.length}</strong> ingredients are used in more than one meal: ${esc(shared.slice(0, 6).map((s) => s.name).join(', '))}${shared.length > 6 ? '…' : ''}</div>` : ''}
+      ${shared.length ? `<div class="badge reuse block">♻️ <strong>${shared.length}</strong> ingredients are used in more than one meal: ${esc(shared.slice(0, 6).map((s) => s.name).join(', '))}${shared.length > 6 ? '…' : ''}</div>` : ''}
       ${recipes.length ? `<ul class="plan-list">
         ${recipes.map((r) => `
           <li class="plan-item">
             <a href="#/recipe/${esc(r.id)}" class="plan-link">
               ${recipeArt(r, 'thumb')}
-              <span><strong>${esc(r.title)}</strong><small>${r.time ? `${r.time} min · ` : ''}${euro(r.cost)}</small></span>
+              <span><strong>${esc(r.title)}</strong><small>${r.time ? `~${r.time} min · ` : ''}${euro(r.cost)}</small></span>
             </a>
             <div class="portions" data-id="${esc(r.id)}">
               <button class="round sm" data-d="-1" aria-label="Fewer portions">−</button>
@@ -436,14 +598,46 @@ function planScreen() {
 
 // ---------- shopping list ----------
 
+const OWNED = { id: 'owned', label: 'Already in your kitchen', emoji: '🧊' };
+
+function listItemHtml(it) {
+  const store = storeOf(it.store);
+  return `
+    <li class="shop-item ${it.checked ? 'done' : ''}" data-key="${esc(it.key)}">
+      <label class="check">
+        <input type="checkbox" ${it.checked ? 'checked' : ''}>
+        <span class="tick"></span>
+        <span class="item-text">
+          <span class="item-name">${esc(it.name)}</span>
+          ${it.amount ? `<span class="item-amt">${esc(it.amount)}</span>` : ''}
+          ${it.from.length > 1 ? `<span class="item-shared">♻️ ${it.from.length}</span>` : ''}
+        </span>
+      </label>
+      ${it.from.length ? `
+      <span class="info-wrap">
+        <button class="info-i" type="button" aria-label="Recipes that use ${esc(it.name)}">i</button>
+        <span class="tip" role="tooltip"><strong>Used in:</strong>${it.from.map((t) => `<span>• ${esc(t)}</span>`).join('')}</span>
+      </span>` : ''}
+      ${it.cat === 'staple' || it.owned ? '' : `
+      <select class="store-pick" style="--store:${store.color}" aria-label="Shop for ${esc(it.name)}">
+        ${STORES.map((s) => `<option value="${s.id}" ${s.id === it.store ? 'selected' : ''}>${s.short}</option>`).join('')}
+      </select>`}
+      ${it.custom ? `<button class="remove" data-custom="${esc(it.id)}" aria-label="Remove">✕</button>` : ''}
+    </li>`;
+}
+
 function listScreen() {
   const items = buildList();
+  items.forEach((it) => { it.owned = !it.custom && it.cat !== 'staple' && inKitchen(it.key); });
+  const toBuy = items.filter((it) => !it.owned);
   const byStore = state.listGroup === 'store';
   const groups = byStore
-    ? STORES.map((s) => ({ id: s.id, label: s.label, emoji: '🏪', items: items.filter((it) => it.store === s.id && it.cat !== 'staple') }))
-      .concat([{ id: 'staple', label: 'Check you have', emoji: '🧂', items: items.filter((it) => it.cat === 'staple') }])
-    : CATEGORIES.map((c) => ({ ...c, items: items.filter((it) => it.cat === c.id) }));
-  const left = items.filter((it) => !it.checked && it.cat !== 'staple').length;
+    ? STORES.map((s) => ({ id: s.id, label: s.label, emoji: '🏪', items: toBuy.filter((it) => it.store === s.id && it.cat !== 'staple') }))
+      .concat([{ id: 'staple', label: 'Check you have', emoji: '🧂', items: toBuy.filter((it) => it.cat === 'staple') }])
+    : CATEGORIES.map((c) => ({ ...c, items: toBuy.filter((it) => it.cat === c.id) }));
+  groups.push({ ...OWNED, items: items.filter((it) => it.owned) });
+  const left = toBuy.filter((it) => !it.checked && it.cat !== 'staple').length;
+  const recipes = state.liked.map(getRecipe).filter(Boolean);
 
   view.innerHTML = `
     <section class="screen">
@@ -462,29 +656,22 @@ function listScreen() {
       </form>
       ${groups.filter((g) => g.items.length).map((g) => `
         <h2 class="group-title">${g.emoji} ${esc(g.label)} <small>${g.items.length}</small></h2>
-        <ul class="shop-list">
-          ${g.items.map((it) => {
-            const store = STORES.find((s) => s.id === it.store) || STORES[0];
-            return `
-            <li class="shop-item ${it.checked ? 'done' : ''}" data-key="${esc(it.key)}">
-              <label class="check">
-                <input type="checkbox" ${it.checked ? 'checked' : ''}>
-                <span class="tick"></span>
-                <span class="item-text">
-                  <span class="item-name">${esc(it.name)}</span>
-                  ${it.amount ? `<span class="item-amt">${esc(it.amount)}</span>` : ''}
-                  ${it.from.length > 1 ? `<span class="item-shared" title="${esc(it.from.join(', '))}">♻️ ${it.from.length} meals</span>` : ''}
-                </span>
-              </label>
-              ${it.cat === 'staple' ? '' : `
-              <select class="store-pick" style="--store:${store.color}" aria-label="Shop for ${esc(it.name)}">
-                ${STORES.map((s) => `<option value="${s.id}" ${s.id === it.store ? 'selected' : ''}>${s.short}</option>`).join('')}
-              </select>`}
-              ${it.custom ? `<button class="remove" data-custom="${esc(it.id)}" aria-label="Remove">✕</button>` : ''}
-            </li>`;
-          }).join('')}
-        </ul>`).join('')}
+        ${g.id === 'owned' ? '<p class="hint">These match your <a href="#/kitchen">kitchen</a>, so you don\'t need to buy them. Tick them off as you check.</p>' : ''}
+        <ul class="shop-list">${g.items.map(listItemHtml).join('')}</ul>`).join('')}
       ${items.some((it) => it.checked) ? '<div class="actions"><button class="btn ghost" id="clear">Untick everything</button></div>' : ''}
+      ${toBuy.length ? `<section class="price-section" id="prices">${priceSectionHtml(toBuy)}</section>` : ''}
+      ${toBuy.length && pricesEnabled() ? `<section class="brand-section" id="brands">${brandSectionHtml(toBuy)}</section>` : ''}
+      ${toBuy.length ? `<section class="delivery-section" id="delivery">${deliveryHtml(toBuy)}</section>` : ''}
+      ${recipes.length ? `
+        <h2 class="section-title">👩‍🍳 How to cook your meals</h2>
+        ${recipes.map((r) => `
+          <details class="howto">
+            <summary>${recipeArt(r, 'thumb')}<span><strong>${esc(r.title)}</strong><small>${portionsFor(r.id)} portions${r.time ? ` · ~${r.time} min` : ''}</small></span></summary>
+            <h3>Ingredients</h3>
+            <ul class="ingredients">${ingredientRows(r, portionsFor(r.id) / (r.serves || 4))}</ul>
+            <h3>Method</h3>
+            <ol class="method">${r.steps.map((s) => `<li>${esc(s)}</li>`).join('')}</ol>
+          </details>`).join('')}` : ''}
     </section>`;
 
   const setItem = (key, patch) => { state.items[key] = { ...state.items[key], ...patch }; save(); };
@@ -493,19 +680,14 @@ function listScreen() {
       setItem(li.dataset.key, { checked: e.target.checked });
       li.classList.toggle('done', e.target.checked);
     });
-    li.querySelector('.store-pick')?.addEventListener('change', (e) => {
-      setItem(li.dataset.key, { store: e.target.value });
-      listScreen();
-    });
+    li.querySelector('.store-pick')?.addEventListener('change', (e) => { setItem(li.dataset.key, { store: e.target.value }); listScreen(); });
   });
   view.querySelectorAll('[data-custom]').forEach((b) => b.addEventListener('click', () => {
     state.custom = state.custom.filter((c) => c.id !== b.dataset.custom);
     delete state.items[`custom:${b.dataset.custom}`];
     save(); listScreen();
   }));
-  view.querySelectorAll('[data-group]').forEach((b) => b.addEventListener('click', () => {
-    state.listGroup = b.dataset.group; save(); listScreen();
-  }));
+  view.querySelectorAll('[data-group]').forEach((b) => b.addEventListener('click', () => { state.listGroup = b.dataset.group; save(); listScreen(); }));
   view.querySelector('#add').addEventListener('submit', (e) => {
     e.preventDefault();
     const name = e.target.item.value.trim();
@@ -518,12 +700,15 @@ function listScreen() {
     for (const k of Object.keys(state.items)) state.items[k].checked = false;
     save(); listScreen();
   });
-  view.querySelector('#share').addEventListener('click', () => shareList(items));
+  view.querySelector('#share').addEventListener('click', () => shareList(toBuy));
+  bindPriceSection(toBuy);
+  bindBrandSection(toBuy);
+  bindDelivery(toBuy);
 }
 
 async function shareList(items) {
   const lines = items.filter((it) => !it.checked).map((it) => {
-    const store = it.store ? ` [${STORES.find((s) => s.id === it.store)?.short}]` : '';
+    const store = it.store ? ` [${storeOf(it.store).short}]` : '';
     return `☐ ${it.name}${it.amount ? ` (${it.amount})` : ''}${store}`;
   });
   const text = `🛒 Shopping list\n\n${lines.join('\n')}`;
@@ -533,14 +718,375 @@ async function shareList(items) {
   } catch { /* share cancelled */ }
 }
 
+// ---------- price comparison (end of the shopping list) ----------
+
+const priceable = (items) => items.filter((it) => it.cat !== 'staple');
+
+function priceSectionHtml(items) {
+  const header = '<h2 class="section-title">💶 Price comparison</h2>';
+  if (!pricesEnabled()) {
+    return `${header}
+      <div class="card-block">
+        <p>Compare what this list costs at <strong>Tesco, Dunnes, SuperValu, Aldi and Lidl</strong> using live prices from BasketWatch Ireland.</p>
+        <p class="hint">Price comparison isn't switched on yet. It needs a small free relay set up in Supabase (see "Turning on shop prices" in the README).</p>
+      </div>`;
+  }
+  const list = priceable(items);
+  const results = cachedPrices(list);
+  if (!results) {
+    return `${header}
+      <div class="card-block center">
+        <p>See what these ${list.length} items cost at each chain today.</p>
+        <button class="btn primary" id="compare">Compare prices</button>
+        <div class="price-progress" hidden><div class="bar"><span></span></div><small></small></div>
+      </div>`;
+  }
+  const sum = summarize(list, results);
+  const nearestKm = (id) => (state.nearest[id] != null ? `<small>${formatKm(state.nearest[id])}</small>` : '');
+  const ranked = CHAINS.filter((c) => sum.totals[c.id].found).sort((a, b) => sum.totals[a.id].total - sum.totals[b.id].total);
+  return `${header}
+    <div class="store-totals">
+      ${ranked.map((c) => {
+        const t = sum.totals[c.id];
+        return `<div class="store-total ${c.id === sum.best ? 'best' : ''}" style="--store:${c.color}">
+          <span class="store-name">${c.short}</span>
+          <strong>${money(t.total)}</strong>
+          <small>${t.found} of ${list.length} items</small>
+          ${nearestKm(c.id)}
+          ${c.id === sum.best ? '<span class="best-tag">Best value</span>' : ''}
+        </div>`;
+      }).join('')}
+    </div>
+    ${sum.mixFound ? `<p class="mix">🧠 Cheapest if you split your shop: <strong>${money(sum.mix)}</strong> for ${sum.mixFound} items.</p>` : ''}
+    <div class="price-table-wrap">
+      <table class="price-table">
+        <thead><tr><th>Item</th>${CHAINS.map((c) => `<th style="--store:${c.color}">${c.short}</th>`).join('')}</tr></thead>
+        <tbody>
+          ${list.map((it) => {
+            const r = results[it.key];
+            const cheapest = cheapestStore(r);
+            return `<tr><td>${esc(it.name)}</td>${CHAINS.map((c) => {
+              const p = r?.[c.id];
+              if (!p) return '<td class="na">–</td>';
+              const title = `${p.name}${p.offer ? ` · ${p.offer}` : ''}${p.member ? ` · member price €${p.member}` : ''}`;
+              return `<td class="${c.id === cheapest ? 'cheapest' : ''}"><a href="${esc(p.url)}" target="_blank" rel="noopener" title="${esc(title)}">${money(p.price)}</a></td>`;
+            }).join('')}</tr>`;
+          }).join('')}
+        </tbody>
+        <tfoot><tr><th>Total</th>${CHAINS.map((c) => `<th>${sum.totals[c.id].found ? money(sum.totals[c.id].total) : '–'}</th>`).join('')}</tr></tfoot>
+      </table>
+    </div>
+    <div class="actions">
+      <button class="btn ghost sm" id="refresh-prices">Refresh prices</button>
+      <button class="btn primary" id="flag-cheapest">Flag items with the cheapest shop</button>
+    </div>
+    <p class="hint">Online shelf prices from <a href="https://basketwatchireland.com" target="_blank" rel="noopener">BasketWatch Ireland</a>, collected each morning. For each item we chose the cheapest pack that covers what you need. In-store prices and loyalty deals can differ. Tap a price to see the product.${Object.keys(state.nearest).length ? '' : ' <a href="#/shops">Find your nearest shops</a> to see distances.'}</p>`;
+}
+
+function bindPriceSection(items) {
+  const list = priceable(items);
+  view.querySelector('#compare')?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    const prog = view.querySelector('.price-progress');
+    prog.hidden = false;
+    const { failed } = await comparePrices(list, (done, total) => {
+      prog.querySelector('span').style.width = `${(done / total) * 100}%`;
+      prog.querySelector('small').textContent = `Checking prices… ${done} of ${total}`;
+    });
+    if (failed) toast(`${failed} price${failed > 1 ? 's' : ''} couldn't load. Tap Compare again in a minute.`);
+    rerenderPrices(items);
+  });
+  view.querySelector('#refresh-prices')?.addEventListener('click', () => { clearPriceCache(); rerenderPrices(items); });
+  view.querySelector('#flag-cheapest')?.addEventListener('click', () => {
+    const results = cachedPrices(list) || {};
+    let n = 0;
+    for (const it of list) {
+      const best = cheapestStore(results[it.key]);
+      if (best) { state.items[it.key] = { ...state.items[it.key], store: best }; n++; }
+    }
+    state.listGroup = 'store';
+    save(); toast(`Flagged ${n} items with their cheapest shop`); listScreen();
+  });
+}
+
+function rerenderPrices(items) {
+  const section = view.querySelector('#prices');
+  if (!section) return;
+  section.innerHTML = priceSectionHtml(items);
+  bindPriceSection(items);
+  const brands = view.querySelector('#brands');
+  if (brands) { brands.innerHTML = brandSectionHtml(items); bindBrandSection(items); }
+  const delivery = view.querySelector('#delivery');
+  if (delivery) { delivery.innerHTML = deliveryHtml(items); bindDelivery(items); }
+}
+
+// ---------- brand check: own-brand vs big brands ----------
+
+const unitText = (u) => (u ? `${money(u.value)}/${u.basis}` : '');
+const brandName = (b) => (b || 'Brand').toLowerCase().replace(/(^|[\s'-])\S/g, (c) => c.toUpperCase());
+
+function brandRows(options) {
+  return `<table class="price-table brand-table">
+    <thead><tr><th>Product</th><th>Cheapest at</th><th>Price</th><th>Per kg/l</th></tr></thead>
+    <tbody>${options.map((o, i) => `<tr class="${i === 0 ? 'cheapest-row' : ''}">
+      <td>${o.own ? '<span class="own-tag">Own-brand</span> ' : `<span class="brand-tag">${esc(brandName(o.brand))}</span> `}${esc(o.name)}</td>
+      <td><span class="chain-dot" style="--store:${storeOf(o.store).color}"></span> ${storeOf(o.store).short}</td>
+      <td><a href="${esc(o.url)}" target="_blank" rel="noopener">${money(o.price)}</a></td>
+      <td>${unitText(o.unit) || '–'}</td>
+    </tr>`).join('')}</tbody>
+  </table>`;
+}
+
+function savingText(options) {
+  const s = brandSaving(options);
+  return s ? `Own-brand ${unitText(s.own.unit)} vs ${esc(brandName(s.named.brand))} ${unitText(s.named.unit)}: <strong>save ${s.pct}%</strong>` : '';
+}
+
+function brandSectionHtml(items) {
+  if (!pricesEnabled()) return '';
+  const list = priceable(items);
+  const brands = cachedPrices(list) ? cachedBrands(list) : null;
+  const rows = brands ? list.filter((it) => (brands[it.key] || []).length > 1) : [];
+  return `
+    <h2 class="section-title">🏷️ Brand check</h2>
+    <p class="hint">Own-brand vs big brands (Barilla, Green Giant, Heinz…), compared per kg or litre so pack sizes are fair.</p>
+    <form class="add-item" id="brand-search">
+      <input class="input" name="q" placeholder="Check any product, e.g. frozen sweetcorn" autocomplete="off">
+      <button class="btn primary" type="submit">Check</button>
+    </form>
+    <div id="brand-result"></div>
+    ${brands ? rows.map((it) => `
+      <details class="howto brand-item">
+        <summary><span><strong>${esc(it.name)}</strong><small>${savingText(brands[it.key]) || `${brands[it.key].length} options`}</small></span></summary>
+        <div class="price-table-wrap">${brandRows(brands[it.key])}</div>
+      </details>`).join('') : '<p class="hint">Run the price comparison above to see brand options for everything on your list.</p>'}`;
+}
+
+function bindBrandSection(items) {
+  const form = view.querySelector('#brand-search');
+  if (!form) return;
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const q = e.target.q.value.trim();
+    const out = view.querySelector('#brand-result');
+    if (!q) return;
+    out.innerHTML = '<p class="hint">Checking brands…</p>';
+    try {
+      const options = await searchBrands(q);
+      out.innerHTML = options.length
+        ? `<div class="card-block brand-result"><h3>${esc(q)}</h3>${savingText(options) ? `<p class="saving">${savingText(options)}</p>` : ''}<div class="price-table-wrap">${brandRows(options)}</div></div>`
+        : `<p class="hint">No products found for "${esc(q)}". Try a simpler name, e.g. "peas".</p>`;
+    } catch {
+      out.innerHTML = '<p class="error">Couldn\'t check prices right now. Try again in a minute.</p>';
+    }
+  });
+}
+
+// ---------- delivery calculator (end of the shopping list) ----------
+
+function numberInput(field, value, { step = 0.5, chain = '' } = {}) {
+  return `<input class="num" type="number" inputmode="decimal" min="0" step="${step}" data-field="${field}" data-chain="${chain}"
+    value="${value ?? ''}" placeholder="–">`;
+}
+
+function deliveryHtml(items) {
+  const d = state.delivery;
+  const list = priceable(items);
+  const results = pricesEnabled() ? cachedPrices(list) : null;
+  const sum = results ? summarize(list, results) : null;
+  const meals = state.liked.length;
+  const portions = state.liked.reduce((n, id) => n + portionsFor(id), 0);
+
+  // What the groceries cost: best single shop from the price comparison, or your own estimate.
+  const basketGuess = d.basketGuess ?? 60;
+  const home = sum?.best ? sum.totals[sum.best].total : basketGuess;
+  const food = portions * d.takeawayMeal;
+  const takeaway = food + food * (d.servicePct / 100) + meals * (d.appFee + d.tip);
+  const saved = takeaway - home;
+
+  const rows = CHAINS.map((c) => {
+    const basket = sum ? (sum.totals[c.id].found ? sum.totals[c.id].total : null) : basketGuess;
+    const fee = d.fees[c.id];
+    const delivered = basket != null && fee != null ? basket + fee : null;
+    const km = state.nearest[c.id];
+    const inStore = basket != null && km != null ? basket + km * 2 * d.perKm : null;
+    return { c, basket, fee, delivered, km, inStore };
+  });
+  const options = rows.flatMap((r) => [
+    r.delivered != null && { label: `${r.c.short} delivered`, cost: r.delivered },
+    r.inStore != null && { label: `${r.c.short} in store`, cost: r.inStore },
+  ]).filter(Boolean).sort((a, b) => a.cost - b.cost);
+  const cheapest = options[0];
+
+  return `
+    <h2 class="section-title">🚚 Delivery calculator</h2>
+    <div class="card-block calc">
+      <h3>🛵 Cook it yourself vs. order takeaway</h3>
+      <p class="hint">What your ${meals} meal${meals === 1 ? '' : 's'} (${portions} portions) would cost on Uber Eats, Deliveroo, Just Eat or DoorDash/Wolt. Change the numbers to match what you usually pay.</p>
+      <div class="calc-grid">
+        <label>Takeaway main, per person ${numberInput('takeawayMeal', d.takeawayMeal)}</label>
+        <label>Delivery fee, per order ${numberInput('appFee', d.appFee, { step: 0.1 })}</label>
+        <label>Service fee % ${numberInput('servicePct', d.servicePct, { step: 1 })}</label>
+        <label>Tip, per order ${numberInput('tip', d.tip)}</label>
+        ${sum?.best ? '' : `<label>Your grocery bill ${numberInput('basketGuess', basketGuess, { step: 1 })}</label>`}
+      </div>
+      <div class="versus">
+        <div><small>Takeaway</small><strong>${money(takeaway)}</strong><small>${money(portions ? takeaway / portions : 0)} a portion</small></div>
+        <div class="vs">vs</div>
+        <div class="home"><small>Cooking at home${sum?.best ? ` (${storeOf(sum.best).short})` : ''}</small><strong>${money(home)}</strong><small>${money(portions ? home / portions : 0)} a portion</small></div>
+      </div>
+      ${meals ? `<p class="saving ${saved > 0 ? '' : 'neg'}">${saved > 0
+        ? `💰 Cooking saves you about <strong>${money(saved)}</strong> this week (${money(saved * 52)} a year).`
+        : 'Takeaway works out cheaper with these numbers. Check your estimates!'}</p>` : '<p class="hint">Pick some meals to compare.</p>'}
+      ${sum?.best ? '<p class="hint">Your grocery cost is the best-value shop from the price comparison above, so it includes everything on your list.</p>' : ''}
+    </div>
+
+    <div class="card-block calc">
+      <h3>🛒 Grocery delivery vs. going to the shop</h3>
+      <p class="hint">Enter each chain's delivery fee for your slot (leave it blank if they don't deliver to you). Driving costs ${numberInput('perKm', d.perKm, { step: 0.05 })} € per km, there and back.</p>
+      <div class="price-table-wrap">
+        <table class="price-table calc-table">
+          <thead><tr><th>Shop</th><th>Basket</th><th>Delivery fee</th><th>Delivered</th><th>In store</th></tr></thead>
+          <tbody>
+            ${rows.map((r) => `<tr>
+              <td><span class="chain-dot" style="--store:${r.c.color}"></span> ${r.c.short}</td>
+              <td>${r.basket != null ? money(r.basket) : '–'}</td>
+              <td>${numberInput('fee', r.fee, { chain: r.c.id })}</td>
+              <td class="${cheapest && r.delivered === cheapest.cost ? 'cheapest' : ''}">${r.delivered != null ? money(r.delivered) : '–'}</td>
+              <td class="${cheapest && r.inStore === cheapest.cost ? 'cheapest' : ''}">${r.inStore != null ? `${money(r.inStore)}<small>${formatKm(r.km)}</small>` : '–'}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+      ${cheapest ? `<p class="saving">🏆 Cheapest way to get your shopping: <strong>${esc(cheapest.label)}</strong> at ${money(cheapest.cost)}.</p>` : ''}
+      <p class="hint">${sum ? '' : 'Run the price comparison above to fill in each shop\'s basket. '}${Object.keys(state.nearest).length ? '' : '<a href="#/shops">Find your nearest shops</a> to work out the in-store driving cost. '}Delivery fees, minimum spends and app fees vary by area, time slot and offer, so check them when you order.</p>
+    </div>`;
+}
+
+function bindDelivery(items) {
+  const section = view.querySelector('#delivery');
+  if (!section) return;
+  section.querySelectorAll('input[data-field]').forEach((input) => input.addEventListener('change', () => {
+    const v = input.value === '' ? null : Math.max(0, Number(input.value));
+    if (input.dataset.field === 'fee') state.delivery.fees[input.dataset.chain] = v;
+    else state.delivery[input.dataset.field] = v ?? 0;
+    save();
+    section.innerHTML = deliveryHtml(items);
+    bindDelivery(items);
+  }));
+}
+
+// ---------- nearest shops ----------
+
+let shopCache = null; // { key, shops }
+
+function shopsScreen() {
+  const loc = state.location;
+  view.innerHTML = `
+    <section class="screen">
+      <h1>Nearest shops</h1>
+      <p class="sub">How far your nearest Tesco, Dunnes, SuperValu, Aldi and Lidl are.</p>
+      <div class="card-block">
+        <button class="btn primary" id="locate">📍 Use my location</button>
+        <form class="add-item" id="place">
+          <input class="input" name="q" placeholder="Or type a town or Eircode" autocomplete="off" value="">
+          <button class="btn" type="submit">Search</button>
+        </form>
+        ${loc ? `<p class="hint">Showing shops near <strong>${esc(loc.label || 'your location')}</strong>.</p>` : ''}
+      </div>
+      <div id="shop-results">${loc ? '<p class="hint center">Finding shops…</p>' : ''}</div>
+      <p class="hint">Shop locations from <a href="https://www.openstreetmap.org" target="_blank" rel="noopener">OpenStreetMap</a> contributors. Distances are in a straight line.</p>
+    </section>`;
+  const setLoc = async (getPos) => {
+    const out = view.querySelector('#shop-results');
+    out.innerHTML = '<p class="hint center">Finding shops…</p>';
+    try {
+      const pos = await getPos();
+      state.location = { lat: +pos.lat.toFixed(4), lon: +pos.lon.toFixed(4), label: pos.label };
+      save();
+      shopsScreen();
+    } catch (err) {
+      out.innerHTML = `<p class="error">${esc(err.message)}</p>`;
+    }
+  };
+  view.querySelector('#locate').addEventListener('click', () => setLoc(currentPosition));
+  view.querySelector('#place').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const q = e.target.q.value.trim();
+    if (q) setLoc(() => geocode(q));
+  });
+  if (loc) showShops(loc);
+}
+
+async function showShops(loc) {
+  const out = view.querySelector('#shop-results');
+  const key = `${loc.lat},${loc.lon}`;
+  try {
+    if (shopCache?.key !== key) shopCache = { key, shops: await findShops(loc) };
+  } catch (err) {
+    out.innerHTML = `<p class="error">${esc(err.message)}</p>`;
+    return;
+  }
+  if (currentRoute() !== 'shops') return;
+  const { shops } = shopCache;
+  const nearest = {};
+  for (const c of CHAINS) {
+    const s = shops.find((x) => x.chain === c.id);
+    if (s) nearest[c.id] = +s.km.toFixed(2);
+  }
+  state.nearest = nearest;
+  save();
+  out.innerHTML = `
+    <div id="map" class="map"></div>
+    <ul class="shop-cards">
+      ${CHAINS.map((c) => {
+        const s = shops.find((x) => x.chain === c.id);
+        return `<li class="shop-card" style="--store:${c.color}">
+          <span class="chain-dot"></span>
+          <div class="shop-info">
+            <strong>${c.label}</strong>
+            ${s ? `<small>${esc(s.name)}${s.address ? ` · ${esc(s.address)}` : ''}</small>` : '<small>None within 15 km</small>'}
+          </div>
+          ${s ? `<span class="km">${formatKm(s.km)}</span><a class="btn sm" href="${directionsUrl(s)}" target="_blank" rel="noopener">Directions</a>` : ''}
+        </li>`;
+      }).join('')}
+    </ul>`;
+  try {
+    const L = await loadLeaflet();
+    if (!document.getElementById('map')) return;
+    const map = L.map('map', { scrollWheelZoom: false }).setView([loc.lat, loc.lon], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '&copy; OpenStreetMap contributors',
+    }).addTo(map);
+    L.circleMarker([loc.lat, loc.lon], { radius: 8, color: '#fff', weight: 3, fillColor: '#ef476f', fillOpacity: 1 })
+      .addTo(map).bindPopup('You are here');
+    const bounds = [[loc.lat, loc.lon]];
+    for (const s of shops.slice(0, 40)) {
+      const c = CHAINS.find((x) => x.id === s.chain);
+      L.circleMarker([s.lat, s.lon], { radius: 7, color: '#fff', weight: 2, fillColor: c.color, fillOpacity: 0.95 })
+        .addTo(map).bindPopup(`<strong>${esc(s.name)}</strong><br>${formatKm(s.km)} away<br><a href="${directionsUrl(s)}" target="_blank" rel="noopener">Directions</a>`);
+    }
+    for (const c of CHAINS) {
+      const s = shops.find((x) => x.chain === c.id);
+      if (s) bounds.push([s.lat, s.lon]);
+    }
+    if (bounds.length > 1) map.fitBounds(bounds, { padding: [30, 30] });
+  } catch {
+    document.getElementById('map')?.remove();
+  }
+}
+
 // ---------- settings ----------
 
 function settingsScreen() {
   const user = sync.currentUser();
-  const goals = GOALS.filter((g) => state.goals.includes(g.id)).map((g) => g.label).join(', ') || 'None';
+  const names = (ids, list) => list.filter((x) => ids.includes(x.id)).map((x) => x.label).join(', ');
+  const goals = names(state.goals, GOALS) || 'None';
+  const bases = names(state.bases, BASES) || 'Anything';
   const limits = [
     ...ALLERGENS.filter((a) => state.allergies.includes(a.id)).map((a) => `no ${a.label.toLowerCase()}`),
     ...DIETS.filter((d) => state.diets.includes(d.id)).map((d) => d.label.toLowerCase()),
+    ...state.dislikes.map((d) => `no ${foodLabel(d).toLowerCase()}`),
   ].join(', ') || 'None';
   view.innerHTML = `
     <section class="screen">
@@ -557,29 +1103,31 @@ function settingsScreen() {
       <div class="card-block settings-rows">
         <a href="#/goals" class="row"><span>Goals</span><span class="val">${esc(goals)} ›</span></a>
         <a href="#/cook" class="row"><span>Cooking</span><span class="val">${state.cookCount}× for ${state.people} ›</span></a>
-        <a href="#/limits" class="row"><span>Limitations</span><span class="val">${esc(limits)} ›</span></a>
+        <a href="#/base" class="row"><span>Main staples</span><span class="val">${esc(bases)} ›</span></a>
+        <a href="#/limits" class="row"><span>Likes &amp; limits</span><span class="val">${esc(limits)} ›</span></a>
+        <a href="#/kitchen" class="row"><span>My kitchen</span><span class="val">${state.pantry.useUp.length + state.pantry.have.length} items ›</span></a>
       </div>
       <h2>Start over</h2>
       <div class="card-block">
         <button class="btn primary" id="week">Start a new week</button>
-        <p class="hint">Clears your picked meals and list but keeps your preferences.</p>
+        <p class="hint">Clears your picked meals and list but keeps your preferences and kitchen.</p>
         <button class="btn danger" id="reset">Reset everything</button>
       </div>
-      <p class="hint center">Extra recipes from <a href="https://www.themealdb.com" target="_blank" rel="noopener">TheMealDB</a>. Shop prices are coming soon.</p>
+      <p class="hint center">Recipes and photos from <a href="https://www.themealdb.com" target="_blank" rel="noopener">TheMealDB</a>. Prices from <a href="https://basketwatchireland.com" target="_blank" rel="noopener">BasketWatch Ireland</a>. Maps © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>.</p>
     </section>`;
   view.querySelector('#signin')?.addEventListener('click', () => sync.signIn());
   view.querySelector('#signout')?.addEventListener('click', () => sync.signOut());
   view.querySelector('#week').addEventListener('click', () => {
-    if (confirm('Clear this week\'s meals and shopping list?')) { startNewWeek(); go('swipe'); }
+    if (confirm('Clear this week\'s meals and shopping list?')) { startNewWeek(); clearPriceCache(); go('swipe'); }
   });
   view.querySelector('#reset').addEventListener('click', () => {
-    if (confirm('Delete all your data and start from scratch?')) { resetAll(); go('goals'); }
+    if (confirm('Delete all your data and start from scratch?')) { resetAll(); clearPriceCache(); go('goals'); }
   });
 }
 
 // ---------- router ----------
 
-const ONBOARDING = ['goals', 'cook', 'limits'];
+const ONBOARDING = ['goals', 'cook', 'base', 'limits', 'kitchen'];
 const currentRoute = () => location.hash.replace(/^#\/?/, '').split('/')[0] || '';
 
 function render() {
@@ -590,6 +1138,7 @@ function render() {
   const inOnboarding = !state.onboarded && ONBOARDING.includes(route);
   steps.hidden = !inOnboarding;
   nav.hidden = inOnboarding;
+  document.getElementById('gear').hidden = inOnboarding;
   if (inOnboarding) {
     const idx = ONBOARDING.indexOf(route);
     steps.innerHTML = [...ONBOARDING, 'swipe'].map((_, i) => `<span class="${i <= idx ? 'on' : ''}"></span>`).join('');
@@ -599,8 +1148,9 @@ function render() {
   count.textContent = state.liked.length;
   count.hidden = !state.liked.length;
 
-  const screens = { goals: goalsScreen, cook: cookScreen, limits: limitsScreen, swipe: swipeScreen,
-    plan: planScreen, list: listScreen, settings: settingsScreen, recipe: () => recipeScreen(decodeURIComponent(param || '')) };
+  const screens = { goals: goalsScreen, cook: cookScreen, base: baseScreen, limits: limitsScreen, kitchen: kitchenScreen,
+    swipe: swipeScreen, plan: planScreen, list: listScreen, shops: shopsScreen, settings: settingsScreen,
+    recipe: () => recipeScreen(decodeURIComponent(param || '')) };
   (screens[route] || (() => go('swipe')))();
   if (route !== 'swipe') window.scrollTo(0, 0);
 }
