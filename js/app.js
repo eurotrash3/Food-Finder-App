@@ -122,11 +122,17 @@ function deck() {
 }
 
 // Pull extra TheMealDB recipes that match what you like, have, or want as a base.
+// Automatic top-ups are throttled and give up after a few fruitless tries (e.g. strict filters),
+// so the swipe screen never gets stuck re-rendering; "Load more" (force) always tries.
 let fetching = false;
+let lastFetch = 0;
+let fruitless = 0;
 async function topUpFromMealDb(force = false) {
   if (fetching || !navigator.onLine) return;
-  if (!force && deck().length >= 8) return;
+  const before = deck().length;
+  if (!force && (before >= 8 || fruitless >= 3 || Date.now() - lastFetch < 15000)) return;
   fetching = true;
+  lastFetch = Date.now();
   const terms = [
     ...state.pantry.useUp, ...state.likes, ...state.pantry.have.slice(0, 5),
     ...BASES.filter((b) => state.bases.includes(b.id)).flatMap((b) => b.fetch),
@@ -139,7 +145,11 @@ async function topUpFromMealDb(force = false) {
     addFetched(found);
   } catch { /* offline or API busy - built-ins still work */ }
   fetching = false;
-  if (currentRoute() === 'swipe' && !dragging) render();
+  const after = deck().length;
+  fruitless = after > before ? 0 : fruitless + 1;
+  // Only redraw if the "no more recipes" screen is showing - otherwise new cards simply join the
+  // queue behind the current one (redrawing would reload the photo and make it flash).
+  if (currentRoute() === 'swipe' && !dragging && (before === 0 || force)) render();
 }
 
 // ---------- shared form bits ----------
@@ -422,7 +432,7 @@ function swipeScreen() {
   if (!cards.length) {
     view.querySelector('#more').addEventListener('click', (e) => { e.target.textContent = 'Loading…'; topUpFromMealDb(true); });
     view.querySelector('#again')?.addEventListener('click', () => { state.passed = []; save(); render(); });
-    topUpFromMealDb(true);
+    topUpFromMealDb(); // throttled, so an empty deck can't loop
     return;
   }
   const top = view.querySelector('.swipe-card.top');
@@ -1155,7 +1165,10 @@ function render() {
   if (route !== 'swipe') window.scrollTo(0, 0);
 }
 
-window.addEventListener('hashchange', render);
+window.addEventListener('hashchange', () => {
+  if (currentRoute() === 'swipe') fruitless = 0; // filters may have changed - allow fresh top-ups
+  render();
+});
 document.addEventListener('keydown', (e) => {
   if (currentRoute() !== 'swipe' || e.target.matches('input')) return;
   if (e.key === 'ArrowRight') view.querySelector('#like')?.click();
