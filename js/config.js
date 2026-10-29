@@ -8,4 +8,4 @@ export const SUPABASE_ANON_KEY = '';
 
 // Shop price comparison ("Turning on shop prices"): the URL of the deployed supabase/functions/prices
 // relay, e.g. 'https://abcdefgh.supabase.co/functions/v1/prices'.
-export const PRICES_URL = '';
+export const PRICES_URL = 'https://rcbmhtktjsntxboomjsi.supabase.co/functions/v1/prices';

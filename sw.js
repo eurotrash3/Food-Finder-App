@@ -1,7 +1,7 @@
 // Offline support: network first for our own files (so updates show up straight away),
 // falling back to the cached copy when offline. Other sites (TheMealDB, Supabase) are left alone.
 
-const CACHE = 'food-finder-v2';
+const CACHE = 'food-finder-v3';
 const SHELL = [
   './', 'css/styles.css', 'manifest.webmanifest', 'icons/icon.svg',
   'js/app.js', 'js/data.js', 'js/recipes.js', 'js/recipes-index.js', 'js/store.js',
