@@ -41,7 +41,7 @@ function recipeArt(r, cls = '') {
 
 // ---------- food matching (likes, dislikes, kitchen) ----------
 
-const foodLabel = (term) => FOODS.find((f) => f.id === term)?.label || term;
+const foodLabel = (term) => FOODS.find((f) => f.id === term)?.label || term.charAt(0).toUpperCase() + term.slice(1);
 const foodWords = (term) => FOODS.find((f) => f.id === term)?.match || [normalizeName(term)].filter(Boolean);
 const ingredientNames = (r) => [...new Set(r.ingredients.filter((i) => i.cat !== 'staple').map((i) => normName(i.name)))];
 
@@ -331,7 +331,7 @@ const HAVE_SUGGESTIONS = ['rice', 'pasta', 'spaghetti', 'potato', 'onion', 'garl
   'frozen peas', 'paprika', 'cumin', 'curry powder', 'honey', 'sugar'].map((x) => ({ id: x, label: x }));
 
 function kitchenScreen() {
-  const onboarding = !state.onboarded;
+  const onboarding = !state.onboarded || isPlanning();
   view.innerHTML = `
     <section class="screen">
       <h1>${onboarding ? 'What\'s in your kitchen?' : 'My kitchen'}</h1>
@@ -398,6 +398,25 @@ function cardHtml(r, top, planned) {
     </article>`;
 }
 
+// Summary of what the deck is tuned for, shown above the cards. Tapping it re-opens the questions.
+function prefsBar() {
+  const chip = (cls, text) => `<span class="pref ${cls}">${esc(text)}</span>`;
+  const chips = [
+    ...GOALS.filter((g) => state.goals.includes(g.id)).map((g) => chip('goal', `${g.emoji} ${g.label}`)),
+    ...BASES.filter((b) => state.bases.includes(b.id)).map((b) => chip('base', `${b.emoji} ${b.label}`)),
+    ...ALLERGENS.filter((a) => state.allergies.includes(a.id)).map((a) => chip('allergy', `⚠️ No ${a.label.toLowerCase()}`)),
+    ...DIETS.filter((d) => state.diets.includes(d.id)).map((d) => chip('diet', `🌱 ${d.label}`)),
+    ...state.likes.map((t) => chip('like', `❤️ ${foodLabel(t)}`)),
+    ...state.dislikes.map((t) => chip('dislike', `👎 ${foodLabel(t)}`)),
+    ...(state.pantry.useUp.length ? [chip('useup', `⏰ Use up ${state.pantry.useUp.length}`)] : []),
+  ];
+  return `
+    <button class="prefs-bar" id="prefs" aria-label="Change your focus, allergies and likes">
+      <span class="prefs-chips">${chips.length ? chips.join('') : '<span class="pref">No focus set yet, so you\'re seeing a bit of everything</span>'}</span>
+      <span class="prefs-edit">Edit ›</span>
+    </button>`;
+}
+
 function swipeScreen() {
   const cards = deck();
   const planned = plannedNames();
@@ -405,6 +424,7 @@ function swipeScreen() {
   const target = state.cookCount;
   view.innerHTML = `
     <section class="screen swipe-screen">
+      ${prefsBar()}
       <div class="progress">
         <div class="progress-text"><strong>${picked}</strong> of ${target} meals picked</div>
         <div class="bar"><span style="width:${Math.min(100, (picked / target) * 100)}%"></span></div>
@@ -429,6 +449,7 @@ function swipeScreen() {
       <p class="hint center">Swipe right to add to your week, or left to pass. Tap a card to see the recipe.</p>` : ''}
     </section>`;
 
+  view.querySelector('#prefs').addEventListener('click', startPlanning);
   if (!cards.length) {
     view.querySelector('#more').addEventListener('click', (e) => { e.target.textContent = 'Loading…'; topUpFromMealDb(true); });
     view.querySelector('#again')?.addEventListener('click', () => { state.passed = []; save(); render(); });
@@ -591,7 +612,13 @@ function planScreen() {
         <button class="btn ghost" id="swipe">${recipes.length < state.cookCount ? 'Find more meals' : 'Keep swiping'}</button>
         ${recipes.length ? '<button class="btn primary big" id="list">Shopping list</button>' : ''}
       </div>
+      <p class="center"><button class="btn ghost sm" id="new-week">🔄 Start a new week</button></p>
     </section>`;
+  view.querySelector('#new-week').addEventListener('click', () => {
+    if (!state.liked.length || confirm('Clear this week\'s meals and shopping list, and answer the questions again?')) {
+      startNewWeek(); clearPriceCache(); startPlanning();
+    }
+  });
   view.querySelectorAll('.portions').forEach((el) => el.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
     const id = el.dataset.id;
     state.portions[id] = Math.max(1, Math.min(20, portionsFor(id) + +b.dataset.d));
@@ -1120,7 +1147,7 @@ function settingsScreen() {
       <h2>Start over</h2>
       <div class="card-block">
         <button class="btn primary" id="week">Start a new week</button>
-        <p class="hint">Clears your picked meals and list but keeps your preferences and kitchen.</p>
+        <p class="hint">Clears your picked meals and list, then asks your questions again (focus, staples, allergies, likes) before you swipe. Your kitchen is kept.</p>
         <button class="btn danger" id="reset">Reset everything</button>
       </div>
       <p class="hint center">Recipes and photos from <a href="https://www.themealdb.com" target="_blank" rel="noopener">TheMealDB</a>. Prices from <a href="https://basketwatchireland.com" target="_blank" rel="noopener">BasketWatch Ireland</a>. Maps © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>.</p>
@@ -1128,7 +1155,7 @@ function settingsScreen() {
   view.querySelector('#signin')?.addEventListener('click', () => sync.signIn());
   view.querySelector('#signout')?.addEventListener('click', () => sync.signOut());
   view.querySelector('#week').addEventListener('click', () => {
-    if (confirm('Clear this week\'s meals and shopping list?')) { startNewWeek(); clearPriceCache(); go('swipe'); }
+    if (confirm('Clear this week\'s meals and shopping list?')) { startNewWeek(); clearPriceCache(); startPlanning(); }
   });
   view.querySelector('#reset').addEventListener('click', () => {
     if (confirm('Delete all your data and start from scratch?')) { resetAll(); clearPriceCache(); go('goals'); }
@@ -1140,12 +1167,22 @@ function settingsScreen() {
 const ONBOARDING = ['goals', 'cook', 'base', 'limits', 'kitchen'];
 const currentRoute = () => location.hash.replace(/^#\/?/, '').split('/')[0] || '';
 
+// "Planning" walks back through the question pages (focus, cooking, staples, allergies & likes, kitchen)
+// before swiping, like the first run. Kept in sessionStorage so a refresh mid-way doesn't lose it.
+const isPlanning = () => sessionStorage.getItem('ff-planning') === '1';
+function startPlanning() {
+  sessionStorage.setItem('ff-planning', '1');
+  go('goals');
+}
+const stopPlanning = () => sessionStorage.removeItem('ff-planning');
+
 function render() {
   const [route, param] = location.hash.replace(/^#\/?/, '').split('/');
   if (!route) return go(state.onboarded ? 'swipe' : 'goals');
   if (!state.onboarded && !ONBOARDING.includes(route) && route !== 'settings') return go('goals');
+  if (isPlanning() && !ONBOARDING.includes(route)) stopPlanning(); // left the questions part-way
 
-  const inOnboarding = !state.onboarded && ONBOARDING.includes(route);
+  const inOnboarding = (!state.onboarded || isPlanning()) && ONBOARDING.includes(route);
   steps.hidden = !inOnboarding;
   nav.hidden = inOnboarding;
   document.getElementById('gear').hidden = inOnboarding;
