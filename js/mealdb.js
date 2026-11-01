@@ -145,7 +145,8 @@ const UNIT_MAP = { g: 'g', gr: 'g', gram: 'g', grams: 'g', kg: 'kg', ml: 'ml', l
 
 // "200g" -> {qty:200, unit:'g'}; "1/2 tsp" -> {qty:.5, unit:'tsp'}; "2 medium" -> {qty:2, unit:''}; "pinch" -> {qty:0, text:'pinch'}
 export function parseMeasure(raw) {
-  const s = (raw || '').trim().toLowerCase().replace(/½/g, '1/2').replace(/¼/g, '1/4').replace(/¾/g, '3/4');
+  // "1½ kg" -> "1 1/2 kg" (not "11/2", which would read as 5.5)
+  const s = (raw || '').toLowerCase().replace(/½/g, ' 1/2').replace(/¼/g, ' 1/4').replace(/¾/g, ' 3/4').trim();
   const m = s.match(/^(\d+\s+\d+\/\d+|\d+\/\d+|\d+(?:[.,]\d+)?)\s*([a-z]+)?\b/);
   if (!m) return { qty: 0, unit: '', text: (raw || '').trim() };
   let qty;
@@ -170,14 +171,28 @@ const SLOW_WORDS = ['stew', 'hotpot', 'casserole', 'pie', 'roast', 'braise', 'la
 
 // Rough total time: add up the cooking times mentioned in the method, plus prep. Ignores marinating/overnight
 // rests, and slow dishes get at least an hour.
+const DURATION = /(\d+)(?:\s*(?:-|–|to|or)\s*(\d+))?\s*(hours?|hrs?|minutes?|mins?)\b/gi;
+const toMinutes = (m) => {
+  const v = m[2] ? (Number(m[1]) + Number(m[2])) / 2 : Number(m[1]); // a range counts as its middle
+  return /^h/i.test(m[3]) ? v * 60 : v;
+};
+
 function estimateTime(instructions, title) {
+  // Some recipes state it: "Ready in: 45min", or "Prep: 15min › Cook: 30min".
+  const stated = instructions.match(/(?:ready in|total time)\s*:?\s*(\d+)\s*(hours?|hrs?|minutes?|mins?)/i);
+  if (stated) return Math.min(180, Math.max(10, Math.round(toMinutes([0, stated[1], 0, stated[2]]) / 5) * 5));
+  const prep = instructions.match(/prep(?:aration)?(?: time)?\s*:\s*(\d+)\s*(hours?|hrs?|minutes?|mins?)/i);
+  const cook = instructions.match(/cook(?:ing)?(?: time)?\s*:\s*(\d+)\s*(hours?|hrs?|minutes?|mins?)/i);
+  if (prep && cook) {
+    const total = toMinutes([0, prep[1], 0, prep[2]]) + toMinutes([0, cook[1], 0, cook[2]]);
+    return Math.min(180, Math.max(10, Math.round(total / 5) * 5));
+  }
+  // Otherwise add up the times in the method, skipping make-ahead and hands-off waiting.
   let mins = 0;
-  const re = /(\d+)(?:\s*(?:-|–|to)\s*(\d+))?\s*(hours?|hrs?|minutes?|mins?)\b/gi;
-  for (const m of instructions.matchAll(re)) {
+  for (const m of instructions.matchAll(DURATION)) {
     const context = instructions.slice(Math.max(0, m.index - 60), m.index);
-    if (/marinat|overnight|rest|chill|soak|cool|fridge|refrigerat/i.test(context)) continue;
-    const v = Number(m[2] || m[1]);
-    mins += /^h/i.test(m[3]) ? v * 60 : v;
+    if (/marinat|overnight|rest|chill|soak|cool|fridge|refrigerat|dry out|leftover|night before|day old|in advance|ahead/i.test(context)) continue;
+    mins += toMinutes(m);
   }
   let total = mins + 15;
   if (has(title, SLOW_WORDS)) total = Math.max(total, 60);

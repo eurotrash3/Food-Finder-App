@@ -52,8 +52,11 @@ export function buildList() {
   }
   const items = [...map.values()].map((e) => {
     const parts = Object.entries(e.amounts).map(([unit, q]) => formatAmount(roundQty(q, unit), unit));
-    const needGrams = Math.round((e.amounts.g || 0) + (e.amounts.ml || 0)) || null; // helps pick a big enough pack
-    return { ...e, amount: [...parts, ...e.notes].filter(Boolean).join(' + '), needGrams, custom: false };
+    // How much to buy, for pricing: weight/volume (a tin counts as 400 g) and number of pieces (2 onions, 3 cloves).
+    const needGrams = Math.round((e.amounts.g || 0) + (e.amounts.ml || 0) + (e.amounts.tin || 0) * 400) || null;
+    const needCount = Math.ceil((e.amounts[''] || 0) - 0.05) || null;
+    const needCloves = Math.ceil(e.amounts.clove || 0) || null;
+    return { ...e, amount: [...parts, ...e.notes].filter(Boolean).join(' + '), needGrams, needCount, needCloves, custom: false };
   });
   for (const c of state.custom) {
     items.push({ key: `custom:${c.id}`, id: c.id, name: c.name, cat: 'other', amount: '', from: [], needGrams: null, custom: true });

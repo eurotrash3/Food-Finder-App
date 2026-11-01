@@ -33,6 +33,13 @@ const defaults = () => ({
     perKm: 0.25,        // € per km driving to the shop (fuel + wear)
     fees: { tesco: 6, dunnes: 6, supervalu: 6, aldi: null, lidl: null }, // grocery delivery fee, null = not used
   },
+  // Price watch: what you buy often (ticked off the list), plus items you chose to watch.
+  bought: {},       // ingredient name -> { count, last: 'YYYY-MM-DD' }
+  watch: [],        // names added by hand
+  unwatch: [],      // often-bought names you don't want watched
+  priceLog: {},     // name -> { value, basis, price, store, name, url, at } cheapest per kg/l/each at the last check
+  alerts: [],       // [{ name, store, price, was, pct, offer, url, product }] from the last check
+  watchCheckedAt: 0,
   updatedAt: 0,
 });
 

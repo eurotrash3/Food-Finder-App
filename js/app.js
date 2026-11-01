@@ -4,9 +4,16 @@ import { getRecipe, allCandidates, addFetched, isBuiltIn } from './recipes-index
 import { fetchRandomRecipes, fetchByIngredient, normalizeName } from './mealdb.js';
 import { buildList, sharedIngredients, portionsFor, scaledIngredient, normName } from './list.js';
 import { pricesEnabled, comparePrices, cachedPrices, cachedBrands, clearPriceCache, summarize, cheapestStore,
-  searchBrands, brandSaving } from './prices.js';
+  searchBrands, brandSaving, recipeCost, priceInBackground, unpriced, checkWatch } from './prices.js';
 import { currentPosition, geocode, findShops, directionsUrl, formatKm, loadLeaflet } from './shops.js';
 import * as sync from './sync.js';
+
+// iPhones zoom the page into any form field under 16px (like the small shop pickers) and stay zoomed.
+// maximum-scale stops that auto-zoom; iOS still lets people pinch-zoom, so nothing is lost.
+if (/iP(hone|od|ad)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) {
+  const vp = document.querySelector('meta[name=viewport]');
+  vp.content += ', maximum-scale=1';
+}
 
 const view = document.getElementById('view');
 const nav = document.getElementById('nav');
@@ -106,10 +113,52 @@ function score(r, planned) {
   for (const goal of state.goals) if (r.tags.includes(goal)) s += 2;
   s += f.fromPlan.length * 4 + f.have.length * 3 + f.useUp.length * 8 + f.liked.length * 5;
   s -= f.toBuy.length * 1.5;
-  s += (3 - (r.cost || 2)) * (state.goals.includes('money') ? 2.5 : 1.5);
+  // Cost on the 1-3 scale: from shop prices when known (€1.25 a portion = 1, €2.50 = 2...), else the estimate.
+  const c = realCost(r, state.people);
+  const tier = c ? Math.min(3.5, Math.max(0.5, c.perPortion / 1.25)) : (r.cost || 2);
+  s += (3 - tier) * (state.goals.includes('money') ? 2.5 : 1.5);
   if (state.goals.includes('quick') && r.time <= 30) s += 2;
   return s;
 }
+
+// ---------- recipe cost from shop prices ----------
+
+// The cost from shop prices once at least 3/4 of a recipe's ingredients are priced, otherwise null.
+function realCost(r, portions) {
+  const c = recipeCost(r, portions);
+  return c && c.coverage >= 0.75 ? c : null;
+}
+
+const costText = (r, portions) => {
+  const c = realCost(r, portions);
+  return c ? `~€${c.perPortion.toFixed(2)}/portion` : euro(r.cost);
+};
+
+// Updated in place by refreshCosts() as prices arrive, so cards and photos aren't redrawn.
+function costHtml(r, portions) {
+  const text = costText(r, portions);
+  return text ? `<span class="cost ${text.startsWith('~') ? 'real' : ''}" data-cost="${esc(r.id)}" data-portions="${portions}">${text}</span>` : '';
+}
+
+function weekCostText() {
+  const costs = state.liked.map(getRecipe).filter(Boolean).map((r) => realCost(r, portionsFor(r.id)));
+  if (!costs.length || costs.includes(null)) return '';
+  const total = costs.reduce((n, c) => n + c.total, 0);
+  return `💶 About <strong>${money(total)}</strong> of food for the week, from today's shop prices (for the amounts you use).`;
+}
+
+function refreshCosts() {
+  view.querySelectorAll('[data-cost]').forEach((el) => {
+    const r = getRecipe(el.dataset.cost);
+    const text = r && costText(r, +el.dataset.portions);
+    if (text && text !== el.textContent) { el.textContent = text; el.classList.toggle('real', text.startsWith('~')); }
+  });
+  const week = view.querySelector('#week-cost');
+  if (week) { week.innerHTML = weekCostText(); week.hidden = !week.innerHTML; }
+}
+
+// Ask for prices of the ingredients in these recipes (looked up slowly in the background).
+const priceRecipes = (recipes) => priceInBackground(unpriced(recipes.filter(Boolean)), refreshCosts);
 
 function deck() {
   const seen = new Set([...state.liked, ...state.passed]);
@@ -369,7 +418,7 @@ function cardHtml(r, top, planned) {
   const f = fit(r, planned);
   const meta = [
     r.time ? `⏱ ~${r.time} min` : '',
-    r.cost ? `<span class="cost">${euro(r.cost)}</span>` : '',
+    costHtml(r, state.people),
     r.diet !== 'meat' ? `🌱 ${r.diet}` : '',
   ].filter(Boolean);
   const base = BASES.find((b) => b.id === r.base);
@@ -410,11 +459,12 @@ function prefsBar() {
     ...state.dislikes.map((t) => chip('dislike', `👎 ${foodLabel(t)}`)),
     ...(state.pantry.useUp.length ? [chip('useup', `⏰ Use up ${state.pantry.useUp.length}`)] : []),
   ];
+  // On phones the chips sit on one line that scrolls sideways, so the card still fits the screen.
   return `
-    <button class="prefs-bar" id="prefs" aria-label="Change your focus, allergies and likes">
-      <span class="prefs-chips">${chips.length ? chips.join('') : '<span class="pref">No focus set yet, so you\'re seeing a bit of everything</span>'}</span>
-      <span class="prefs-edit">Edit ›</span>
-    </button>`;
+    <div class="prefs-bar">
+      <div class="prefs-chips">${chips.length ? chips.join('') : '<span class="pref">No focus set yet, so you\'re seeing a bit of everything</span>'}</div>
+      <button class="prefs-edit" id="prefs" aria-label="Change your focus, allergies and likes">Edit ›</button>
+    </div>`;
 }
 
 function swipeScreen() {
@@ -462,6 +512,7 @@ function swipeScreen() {
   view.querySelector('#like').addEventListener('click', () => flyOut(top, true, () => decide(top.dataset.id, true)));
   view.querySelector('#info').addEventListener('click', () => go(`recipe/${top.dataset.id}`));
   topUpFromMealDb();
+  priceRecipes([...cards.slice(0, 4), ...state.liked.map(getRecipe)]);
 }
 
 function flyOut(card, like, done) {
@@ -472,33 +523,48 @@ function flyOut(card, like, done) {
   setTimeout(done, 300);
 }
 
+// The card has `touch-action: pan-y`, so on phones an up/down drag scrolls the page (the browser then
+// sends pointercancel) and a sideways drag moves the card. A quick flick counts as a swipe too.
 function setupDrag(card, decideFn) {
-  let startX = 0, startY = 0, dx = 0, dy = 0, active = false;
+  let startX = 0, startY = 0, dx = 0, dy = 0, lastX = 0, lastT = 0, speed = 0, active = false;
   const like = card.querySelector('.stamp.like');
   const nope = card.querySelector('.stamp.nope');
+  const reset = () => {
+    card.style.transition = 'transform .25s';
+    card.style.transform = '';
+    like.style.opacity = nope.style.opacity = 0;
+  };
   card.addEventListener('pointerdown', (e) => {
-    active = true; dragging = true; startX = e.clientX; startY = e.clientY; dx = dy = 0;
+    if (e.button > 0) return;
+    active = true; dragging = true; startX = lastX = e.clientX; startY = e.clientY; dx = dy = speed = 0; lastT = e.timeStamp;
     card.setPointerCapture(e.pointerId);
     card.style.transition = 'none';
   });
   card.addEventListener('pointermove', (e) => {
     if (!active) return;
     dx = e.clientX - startX; dy = e.clientY - startY;
+    if (e.timeStamp > lastT) speed = (e.clientX - lastX) / (e.timeStamp - lastT); // px per ms
+    lastX = e.clientX; lastT = e.timeStamp;
     card.style.transform = `translate(${dx}px, ${dy * 0.3}px) rotate(${dx / 18}deg)`;
     like.style.opacity = Math.max(0, Math.min(1, dx / 100));
     nope.style.opacity = Math.max(0, Math.min(1, -dx / 100));
   });
-  const end = () => {
+  card.addEventListener('pointerup', () => {
     if (!active) return;
     active = false; dragging = false;
-    if (Math.abs(dx) > 100) return flyOut(card, dx > 0, () => decideFn(dx > 0));
-    if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return go(`recipe/${card.dataset.id}`);
-    card.style.transition = 'transform .25s';
-    card.style.transform = '';
-    like.style.opacity = nope.style.opacity = 0;
-  };
-  card.addEventListener('pointerup', end);
-  card.addEventListener('pointercancel', end);
+    const flick = Math.abs(dx) > 40 && Math.abs(speed) > 0.5 && Math.sign(speed) === Math.sign(dx);
+    if (Math.abs(dx) > 100 || flick) {
+      navigator.vibrate?.(12);
+      return flyOut(card, dx > 0, () => decideFn(dx > 0));
+    }
+    if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return go(`recipe/${card.dataset.id}`);
+    reset();
+  });
+  card.addEventListener('pointercancel', () => { // the page started scrolling
+    if (!active) return;
+    active = false; dragging = false;
+    reset();
+  });
 }
 
 function decide(id, like) {
@@ -555,7 +621,7 @@ function recipeScreen(id) {
       ${r.desc ? `<p class="sub">${esc(r.desc)}</p>` : ''}
       <div class="meta">
         ${r.time ? `<span>⏱ ~${r.time} min</span>` : ''}
-        ${r.cost ? `<span class="cost">${euro(r.cost)}</span>` : ''}
+        ${costHtml(r, portions)}
         <span>🍽 ${portions} portion${portions > 1 ? 's' : ''}</span>
       </div>
       ${allergenLabels.length ? `<p class="allergens">⚠️ May contain: ${allergenLabels.join(', ')}. This is detected automatically, so always check the labels.</p>` : ''}
@@ -563,13 +629,14 @@ function recipeScreen(id) {
       <ul class="ingredients">${ingredientRows(r, factor)}</ul>
       <h2>Method</h2>
       <ol class="method">${r.steps.map((s) => `<li>${esc(s)}</li>`).join('')}</ol>
-      ${r.sourceUrl ? `<p class="hint">Recipe from <a href="${esc(r.sourceUrl)}" target="_blank" rel="noopener">${esc(r.source)}</a>. Times and costs are estimates.</p>` : ''}
+      ${r.sourceUrl ? `<p class="hint">Recipe from <a href="${esc(r.sourceUrl)}" target="_blank" rel="noopener">${esc(r.source)}</a>. Times are estimates. Costs per portion come from today's shop prices for the amounts used (€–€€€ is a rough guess shown until prices have loaded).</p>` : ''}
       <div class="actions sticky">
         ${inPlan
           ? '<button class="btn danger" id="toggle">Remove from my week</button>'
           : '<button class="btn primary big" id="toggle">♥ Add to my week</button>'}
       </div>
     </section>`;
+  priceRecipes([r]);
   view.querySelector('#back').addEventListener('click', () => (history.length > 1 ? history.back() : go('swipe')));
   view.querySelector('#toggle').addEventListener('click', () => {
     if (inPlan) {
@@ -592,13 +659,14 @@ function planScreen() {
     <section class="screen">
       <h1>My week</h1>
       <p class="sub">${recipes.length} of ${state.cookCount} meals picked · cooking for ${state.people}</p>
+      <p class="badge week-cost block" id="week-cost" ${weekCostText() ? '' : 'hidden'}>${weekCostText()}</p>
       ${shared.length ? `<div class="badge reuse block">♻️ <strong>${shared.length}</strong> ingredients are used in more than one meal: ${esc(shared.slice(0, 6).map((s) => s.name).join(', '))}${shared.length > 6 ? '…' : ''}</div>` : ''}
       ${recipes.length ? `<ul class="plan-list">
         ${recipes.map((r) => `
           <li class="plan-item">
             <a href="#/recipe/${esc(r.id)}" class="plan-link">
               ${recipeArt(r, 'thumb')}
-              <span><strong>${esc(r.title)}</strong><small>${r.time ? `~${r.time} min · ` : ''}${euro(r.cost)}</small></span>
+              <span><strong>${esc(r.title)}</strong><small>${r.time ? `~${r.time} min · ` : ''}${costHtml(r, portionsFor(r.id))}</small></span>
             </a>
             <div class="portions" data-id="${esc(r.id)}">
               <button class="round sm" data-d="-1" aria-label="Fewer portions">−</button>
@@ -614,6 +682,7 @@ function planScreen() {
       </div>
       <p class="center"><button class="btn ghost sm" id="new-week">🔄 Start a new week</button></p>
     </section>`;
+  priceRecipes(recipes);
   view.querySelector('#new-week').addEventListener('click', () => {
     if (!state.liked.length || confirm('Clear this week\'s meals and shopping list, and answer the questions again?')) {
       startNewWeek(); clearPriceCache(); startPlanning();
@@ -680,12 +749,13 @@ function listScreen() {
     <section class="screen">
       <h1>Shopping list</h1>
       <p class="sub">${items.length ? `${left} item${left === 1 ? '' : 's'} left to get` : 'Your list is empty. Pick some meals first.'}</p>
+      ${alertBanner()}
       <div class="list-tools">
         <div class="segmented">
           <button class="${byStore ? '' : 'on'}" data-group="aisle">By aisle</button>
           <button class="${byStore ? 'on' : ''}" data-group="store">By shop</button>
         </div>
-        <button class="btn ghost sm" id="share">Share</button>
+        <span><a class="btn ghost sm" href="#/deals">🔔 Watch</a><button class="btn ghost sm" id="share">Share</button></span>
       </div>
       <form class="add-item" id="add">
         <input class="input" name="item" placeholder="Add something else, e.g. toilet roll" autocomplete="off">
@@ -715,10 +785,20 @@ function listScreen() {
   view.querySelectorAll('.shop-item').forEach((li) => {
     li.querySelector('input[type=checkbox]').addEventListener('change', (e) => {
       setItem(li.dataset.key, { checked: e.target.checked });
+      if (e.target.checked) markBought(items.find((it) => it.key === li.dataset.key));
       li.classList.toggle('done', e.target.checked);
     });
     li.querySelector('.store-pick')?.addEventListener('change', (e) => { setItem(li.dataset.key, { store: e.target.value }); listScreen(); });
   });
+  // "i" tooltips open on tap (phones can't hover); tapping anywhere else closes them.
+  view.querySelectorAll('.info-i').forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const wrap = b.parentElement;
+    const open = !wrap.classList.contains('open');
+    view.querySelectorAll('.info-wrap.open').forEach((w) => w.classList.remove('open'));
+    wrap.classList.toggle('open', open);
+    b.setAttribute('aria-expanded', open);
+  }));
   view.querySelectorAll('[data-custom]').forEach((b) => b.addEventListener('click', () => {
     state.custom = state.custom.filter((c) => c.id !== b.dataset.custom);
     delete state.items[`custom:${b.dataset.custom}`];
@@ -805,8 +885,8 @@ function priceSectionHtml(items) {
             return `<tr><td>${esc(it.name)}</td>${CHAINS.map((c) => {
               const p = r?.[c.id];
               if (!p) return '<td class="na">–</td>';
-              const title = `${p.name}${p.offer ? ` · ${p.offer}` : ''}${p.member ? ` · member price €${p.member}` : ''}`;
-              return `<td class="${c.id === cheapest ? 'cheapest' : ''}"><a href="${esc(p.url)}" target="_blank" rel="noopener" title="${esc(title)}">${money(p.price)}</a></td>`;
+              const title = `${p.name}${p.note ? ` · ${p.note}` : ''}${p.offer ? ` · ${p.offer}` : ''}${p.member ? ` · member price €${p.member}` : ''}`;
+              return `<td class="${c.id === cheapest ? 'cheapest' : ''}"><a href="${esc(p.url)}" target="_blank" rel="noopener" title="${esc(title)}">${money(p.price)}${p.note ? `<small>${esc(p.note)}</small>` : ''}</a></td>`;
             }).join('')}</tr>`;
           }).join('')}
         </tbody>
@@ -817,7 +897,7 @@ function priceSectionHtml(items) {
       <button class="btn ghost sm" id="refresh-prices">Refresh prices</button>
       <button class="btn primary" id="flag-cheapest">Flag items with the cheapest shop</button>
     </div>
-    <p class="hint">Online shelf prices from <a href="https://basketwatchireland.com" target="_blank" rel="noopener">BasketWatch Ireland</a>, collected each morning. For each item we chose the cheapest pack that covers what you need. In-store prices and loyalty deals can differ. Tap a price to see the product.${Object.keys(state.nearest).length ? '' : ' <a href="#/shops">Find your nearest shops</a> to see distances.'}</p>`;
+    <p class="hint">Online shelf prices from <a href="https://basketwatchireland.com" target="_blank" rel="noopener">BasketWatch Ireland</a>, collected each morning. Each price is what you would pay for the amount your meals need: enough packs to cover it, or loose fruit and veg by the piece or by weight. In-store prices and loyalty deals can differ. Tap a price to see the product.${Object.keys(state.nearest).length ? '' : ' <a href="#/shops">Find your nearest shops</a> to see distances.'}</p>`;
 }
 
 function bindPriceSection(items) {
@@ -1091,7 +1171,8 @@ async function showShops(loc) {
   try {
     const L = await loadLeaflet();
     if (!document.getElementById('map')) return;
-    const map = L.map('map', { scrollWheelZoom: false }).setView([loc.lat, loc.lon], 12);
+    // On phones one finger scrolls the page; pinch to zoom the map, tap the dots for details.
+    const map = L.map('map', { scrollWheelZoom: false, dragging: !L.Browser.mobile }).setView([loc.lat, loc.lon], 12);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19, attribution: '&copy; OpenStreetMap contributors',
     }).addTo(map);
@@ -1111,6 +1192,125 @@ async function showShops(loc) {
   } catch {
     document.getElementById('map')?.remove();
   }
+}
+
+// ---------- price watch ----------
+
+const WEEK = 7 * 24 * 3600 * 1000;
+const isoDay = () => new Date().toISOString().slice(0, 10);
+
+// Ticking an item off the list counts as buying it (once per shopping trip, i.e. at most every 5 days).
+function markBought(it) {
+  if (!it || it.custom || it.cat === 'staple') return;
+  const b = state.bought[it.key] || { count: 0, last: '' };
+  if (!b.last || Date.now() - Date.parse(b.last) >= 5 * 24 * 3600 * 1000) b.count += 1;
+  b.last = isoDay();
+  state.bought[it.key] = b;
+  save();
+}
+
+// Items bought on two or more trips, plus any added by hand (at most 15, to go easy on the price service).
+function watchedNames() {
+  const often = Object.entries(state.bought)
+    .filter(([n, b]) => b.count >= 2 && !state.unwatch.includes(n))
+    .sort((a, b) => b[1].count - a[1].count)
+    .map(([n]) => n);
+  return [...new Set([...state.watch, ...often])].slice(0, 15);
+}
+
+let watching = null; // progress text while a check runs
+
+async function runWatchCheck() {
+  const names = watchedNames();
+  if (watching || !names.length || !pricesEnabled()) return;
+  watching = 'Checking prices…';
+  const { log, alerts } = await checkWatch(names, state.priceLog, (done, total) => {
+    watching = `Checking prices… ${done} of ${total}`;
+    const el = view.querySelector('#watch-progress');
+    if (el) el.textContent = watching;
+  });
+  watching = null;
+  state.priceLog = { ...state.priceLog, ...log };
+  state.alerts = alerts;
+  state.watchCheckedAt = Date.now();
+  save();
+  if (['deals', 'list'].includes(currentRoute())) render();
+  else if (alerts.length) toast(`🔔 ${alerts.length} price drop${alerts.length > 1 ? 's' : ''} on things you buy - see your list`);
+}
+
+function autoCheckWatch() {
+  if (Date.now() - state.watchCheckedAt > WEEK - 24 * 3600 * 1000) runWatchCheck();
+}
+
+const perText = (x) => `${money(x.value)}/${x.basis}`;
+
+function alertHtml(a) {
+  const store = storeOf(a.store);
+  const what = a.pct
+    ? `<strong>${a.pct}% cheaper</strong> than last check (${perText(a)}, was ${money(a.was)}/${a.basis})`
+    : `<strong>On offer:</strong> ${esc(a.offer)}`;
+  return `<li class="alert-item">
+    <span class="chain-dot" style="--store:${store.color}"></span>
+    <span class="alert-text"><strong>${esc(foodLabel(a.name))}</strong>: ${money(a.price)} at ${store.short} - ${what}
+      <a href="${esc(a.url)}" target="_blank" rel="noopener"><small>${esc(a.product)}</small></a></span>
+  </li>`;
+}
+
+function alertBanner() {
+  if (!state.alerts.length || !pricesEnabled()) return '';
+  const n = state.alerts.length;
+  return `<a class="badge alert-banner block" href="#/deals">🔔 ${n} thing${n > 1 ? 's' : ''} you buy ${n > 1 ? 'are' : 'is'} cheaper or on offer this week ›</a>`;
+}
+
+function dealsScreen() {
+  const names = watchedNames();
+  const checked = state.watchCheckedAt ? new Date(state.watchCheckedAt).toLocaleDateString('en-IE', { weekday: 'long', day: 'numeric', month: 'short' }) : '';
+  view.innerHTML = `
+    <section class="screen">
+      <h1>🔔 Price watch</h1>
+      <p class="sub">Once a week, when you open the app, we re-check the prices of things you buy often and show what's cheaper or on special offer. Anything you tick off your shopping list on two shopping trips is watched automatically.</p>
+      ${pricesEnabled() ? '' : '<p class="error">Shop prices aren\'t switched on, so the price watch can\'t run.</p>'}
+      ${state.alerts.length ? `<h2>This week</h2><ul class="alert-list">${state.alerts.map(alertHtml).join('')}</ul>` : ''}
+      <h2>Watching <small>${names.length}</small></h2>
+      <div class="card-block">
+        ${names.length ? `<div class="chips">${names.map((n) => {
+          const p = state.priceLog[n];
+          return `<button class="chip on" data-unwatch="${esc(n)}" title="Stop watching">${esc(foodLabel(n))}${p ? ` · ${perText(p)} ${storeOf(p.store).short}` : ''} ✕</button>`;
+        }).join('')}</div>` : '<p class="hint">Nothing yet. Add things you buy every week, or tick items off your shopping list as you shop.</p>'}
+        <form class="add-item small" id="watch-add">
+          <input class="input" name="food" placeholder="e.g. milk, butter, coffee" autocomplete="off">
+          <button class="btn" type="submit">Watch</button>
+        </form>
+      </div>
+      <div class="actions">
+        <span class="hint" id="watch-progress">${watching || (checked ? `Last checked ${checked}` : 'Not checked yet')}</span>
+        <button class="btn primary" id="watch-now" ${watching || !names.length || !pricesEnabled() ? 'disabled' : ''}>Check now</button>
+      </div>
+      <p class="hint">Alerts show here and on your shopping list when you open the app. The first check records today's prices, so price drops show from the second week (special offers show straight away). Notifications to your phone while the app is closed need a server, and come with cloud sync later.</p>
+    </section>`;
+  view.querySelectorAll('[data-unwatch]').forEach((b) => b.addEventListener('click', () => {
+    const n = b.dataset.unwatch;
+    if (state.watch.includes(n)) state.watch = state.watch.filter((x) => x !== n);
+    else state.unwatch.push(n);
+    state.alerts = state.alerts.filter((a) => a.name !== n);
+    save(); dealsScreen();
+  }));
+  view.querySelector('#watch-add').addEventListener('submit', (e) => {
+    e.preventDefault();
+    for (const raw of e.target.food.value.split(',')) {
+      const n = normalizeName(raw.trim().toLowerCase()) || raw.trim().toLowerCase();
+      if (!n) continue;
+      if (!state.watch.includes(n)) state.watch.push(n);
+      state.unwatch = state.unwatch.filter((x) => x !== n);
+    }
+    save(); dealsScreen();
+  });
+  view.querySelector('#watch-now').addEventListener('click', (e) => {
+    e.target.disabled = true;
+    state.watchCheckedAt = 0;
+    runWatchCheck();
+    view.querySelector('#watch-progress').textContent = watching || 'Checking prices…';
+  });
 }
 
 // ---------- settings ----------
@@ -1143,6 +1343,7 @@ function settingsScreen() {
         <a href="#/base" class="row"><span>Main staples</span><span class="val">${esc(bases)} ›</span></a>
         <a href="#/limits" class="row"><span>Likes &amp; limits</span><span class="val">${esc(limits)} ›</span></a>
         <a href="#/kitchen" class="row"><span>My kitchen</span><span class="val">${state.pantry.useUp.length + state.pantry.have.length} items ›</span></a>
+        <a href="#/deals" class="row"><span>Price watch</span><span class="val">${watchedNames().length} items ›</span></a>
       </div>
       <h2>Start over</h2>
       <div class="card-block">
@@ -1197,7 +1398,7 @@ function render() {
 
   const screens = { goals: goalsScreen, cook: cookScreen, base: baseScreen, limits: limitsScreen, kitchen: kitchenScreen,
     swipe: swipeScreen, plan: planScreen, list: listScreen, shops: shopsScreen, settings: settingsScreen,
-    recipe: () => recipeScreen(decodeURIComponent(param || '')) };
+    deals: dealsScreen, recipe: () => recipeScreen(decodeURIComponent(param || '')) };
   (screens[route] || (() => go('swipe')))();
   if (route !== 'swipe') window.scrollTo(0, 0);
 }
@@ -1206,13 +1407,18 @@ window.addEventListener('hashchange', () => {
   if (currentRoute() === 'swipe') fruitless = 0; // filters may have changed - allow fresh top-ups
   render();
 });
+document.addEventListener('click', () => {
+  document.querySelectorAll('.info-wrap.open').forEach((w) => w.classList.remove('open'));
+});
 document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') document.querySelectorAll('.info-wrap.open').forEach((w) => w.classList.remove('open'));
   if (currentRoute() !== 'swipe' || e.target.matches('input')) return;
   if (e.key === 'ArrowRight') view.querySelector('#like')?.click();
   if (e.key === 'ArrowLeft') view.querySelector('#nope')?.click();
 });
 
 render();
+setTimeout(autoCheckWatch, 3000); // weekly price watch, once the first screen is up
 sync.initSync(render);
 
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {

@@ -398,3 +398,52 @@ h2 small { font-weight: 400; color: var(--muted); font-size: .8rem; margin-left:
 .pref.useup { background: #ffe8d6; color: #9c4a00; }
 .prefs-edit { flex-shrink: 0; font-size: .85rem; font-weight: 700; color: var(--green); }
 .deck { height: min(58dvh, 520px); }
+
+/* ---- phones & touch screens ---- */
+a, button, select, label, summary { touch-action: manipulation; } /* no double-tap zoom or tap delay */
+.swipe-card { touch-action: pan-y; } /* the page still scrolls up and down; sideways drags swipe the card */
+.num { font-size: 16px; } /* iPhone zooms into inputs smaller than 16px */
+.remove { min-width: 44px; min-height: 44px; }
+.info-i { position: relative; }
+.info-i::before { content: ""; position: absolute; inset: -11px; } /* 44px tap area around the small "i" */
+.round.sm { width: 40px; height: 40px; }
+.info-wrap.open .tip { display: flex; }
+.info-wrap:hover .tip, .info-i:focus + .tip { display: none; }
+@media (hover: hover) { .info-wrap:hover .tip { display: flex; } }
+.info-i:focus-visible + .tip { display: flex; }
+@media (hover: none) { .prefs-bar:hover { border-color: var(--line); } }
+
+/* Short screens: fit the card, buttons and tab bar without scrolling. */
+.prefs-bar { cursor: default; padding: 6px 6px 6px 10px; }
+.prefs-edit { border: 0; background: none; padding: 8px 6px; }
+@media (max-width: 600px) {
+  .prefs-chips { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; -webkit-mask-image: linear-gradient(90deg, #000 85%, transparent); mask-image: linear-gradient(90deg, #000 85%, transparent); }
+}
+.deck { height: clamp(300px, calc(100dvh - 318px - env(safe-area-inset-top) - env(safe-area-inset-bottom)), 520px); min-height: 0; }
+@media (max-height: 760px) {
+  .swipe-screen .hint.center { display: none; }
+  .swipe-buttons { margin-top: 12px; }
+  .swipe-buttons .round.big { width: 58px; height: 58px; }
+  .swipe-card .badge + .badge { display: none; }
+  .progress { margin-bottom: 8px; }
+}
+@media (max-width: 380px) {
+  main { padding-left: 12px; padding-right: 12px; }
+  .option-grid { gap: 8px; }
+  .option { padding: 12px; }
+  .card-body h2 { font-size: 1.2rem; }
+  .plan-item { gap: 6px; padding: 8px; }
+  .art.thumb { width: 48px; height: 48px; }
+}
+.price-table td small { display: block; font-size: .68rem; font-weight: 400; color: var(--muted); }
+.cost.real { letter-spacing: 0; font-weight: 700; }
+.badge.week-cost { background: #e3f4e8; color: var(--green); }
+
+/* ---- price watch ---- */
+.alert-banner { display: block; background: #fff3c4; color: #7a5300; text-decoration: none; font-weight: 600; }
+.alert-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+.alert-item { display: flex; gap: 10px; align-items: flex-start; background: #fff; padding: 12px 14px; border-radius: 14px; box-shadow: var(--shadow); font-size: .9rem; line-height: 1.4; }
+.alert-item .chain-dot { margin-top: 4px; }
+.alert-text small { display: block; color: var(--muted); }
+.alert-text a { text-decoration: none; }
+a.btn { text-decoration: none; display: inline-block; }
