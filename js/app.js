@@ -4,9 +4,10 @@ import { getRecipe, allCandidates, addFetched, isBuiltIn } from './recipes-index
 import { fetchRandomRecipes, fetchByIngredient, normalizeName } from './mealdb.js';
 import { buildList, sharedIngredients, portionsFor, scaledIngredient, normName } from './list.js';
 import { pricesEnabled, comparePrices, cachedPrices, cachedBrands, clearPriceCache, summarize, cheapestStore,
-  searchBrands, brandSaving, recipeCost, priceInBackground, unpriced, checkWatch } from './prices.js';
+  searchBrands, brandSaving, recipeCost, storeCosts, priceInBackground, pricesPending, unpriced, checkWatch } from './prices.js';
 import { currentPosition, geocode, findShops, directionsUrl, formatKm, loadLeaflet } from './shops.js';
 import * as sync from './sync.js';
+import { icon } from './icons.js';
 
 // iPhones zoom the page into any form field under 16px (like the small shop pickers) and stay zoomed.
 // maximum-scale stops that auto-zoom; iOS still lets people pinch-zoom, so nothing is lost.
@@ -41,7 +42,7 @@ function toggleIn(arr, value) {
 }
 
 function recipeArt(r, cls = '') {
-  if (!r.image) return `<div class="art ${cls}" style="background:${esc(r.color || '#adc178')}"><span>${r.emoji || '🍽️'}</span></div>`;
+  if (!r.image) return `<div class="art ${cls}" style="background:${esc(r.color || '#adc178')}">${icon('bowl', 'art-icon')}</div>`;
   const src = cls === 'thumb' ? `${r.image}/preview` : r.image;
   return `<div class="art ${cls}"><img src="${esc(src)}" alt="" loading="lazy" draggable="false"></div>`;
 }
@@ -123,15 +124,19 @@ function score(r, planned) {
 
 // ---------- recipe cost from shop prices ----------
 
-// The cost from shop prices once at least 3/4 of a recipe's ingredients are priced, otherwise null.
+// The lowest cost from shop prices: the cheapest shop, buying its cheapest options (usually its own brand).
+// { total, perPortion, store }, or null until most of the recipe is priced.
 function realCost(r, portions) {
+  const best = storeCosts(r, portions)[0];
+  if (best) return { ...best.cheapest, store: best.store };
   const c = recipeCost(r, portions);
   return c && c.coverage >= 0.75 ? c : null;
 }
 
 const costText = (r, portions) => {
   const c = realCost(r, portions);
-  return c ? `~€${c.perPortion.toFixed(2)}/portion` : euro(r.cost);
+  if (!c) return euro(r.cost);
+  return `~€${c.perPortion.toFixed(2)}/portion${c.store ? ` at ${storeOf(c.store).short}` : ''}`;
 };
 
 // Updated in place by refreshCosts() as prices arrive, so cards and photos aren't redrawn.
@@ -140,11 +145,55 @@ function costHtml(r, portions) {
   return text ? `<span class="cost ${text.startsWith('~') ? 'real' : ''}" data-cost="${esc(r.id)}" data-portions="${portions}">${text}</span>` : '';
 }
 
-function weekCostText() {
-  const costs = state.liked.map(getRecipe).filter(Boolean).map((r) => realCost(r, portionsFor(r.id)));
-  if (!costs.length || costs.includes(null)) return '';
-  const total = costs.reduce((n, c) => n + c.total, 0);
-  return `💶 About <strong>${money(total)}</strong> of food for the week, from today's shop prices (for the amounts you use).`;
+// Table of what something costs at each shop: cheapest options vs big-name brands.
+// rows: [{ store, cheapest: { total }, brand: { total } }], cheapest first.
+function costTable(rows, portions) {
+  if (!rows.length) return '';
+  const each = (t) => (portions ? `<small>${money(t / portions)} a portion</small>` : '');
+  return `<div class="price-table-wrap"><table class="price-table cost-table">
+    <thead><tr><th>Shop</th><th>Cheapest</th><th>Big brands</th></tr></thead>
+    <tbody>${rows.map((x, i) => `<tr>
+      <td><span class="chain-dot" style="--store:${storeOf(x.store).color}"></span> ${storeOf(x.store).short}</td>
+      <td class="${i === 0 ? 'cheapest' : ''}">${money(x.cheapest.total)}${each(x.cheapest.total)}</td>
+      <td>${money(x.brand.total)}${each(x.brand.total)}</td>
+    </tr>`).join('')}</tbody>
+  </table></div>`;
+}
+
+function recipeCostHtml(r, portions) {
+  const rows = storeCosts(r, portions);
+  if (!rows.length) {
+    return pricesEnabled() ? '<p class="hint">Working out what this costs at each shop…</p>' : '';
+  }
+  const best = rows[0];
+  const save = best.brand.total - best.cheapest.total;
+  return `<p>Cheapest at <strong>${storeOf(best.store).label}</strong>: ${money(best.cheapest.total)} for ${portions} portion${portions > 1 ? 's' : ''}${
+    save >= 0.1 ? `, or ${money(best.brand.total)} with big-name brands (${money(save)} more)` : ''}.</p>
+    ${costTable(rows, portions)}
+    <p class="hint">"Cheapest" uses each shop's lowest-priced option for every ingredient, usually its own brand. "Big brands" uses the cheapest named brand where the shop has one. Costs are for the amounts the recipe uses; shops that don't sell an ingredient are given the typical price for it.</p>`;
+}
+
+// The week's meals at each shop that prices all of them.
+function weekCosts() {
+  const recipes = state.liked.map(getRecipe).filter(Boolean);
+  if (!recipes.length) return [];
+  const per = recipes.map((r) => storeCosts(r, portionsFor(r.id)));
+  if (per.some((rows) => !rows.length)) return [];
+  return CHAINS.map((c) => {
+    const rows = per.map((list) => list.find((x) => x.store === c.id));
+    if (rows.includes(undefined)) return null;
+    return { store: c.id, cheapest: { total: rows.reduce((n, x) => n + x.cheapest.total, 0) },
+      brand: { total: rows.reduce((n, x) => n + x.brand.total, 0) } };
+  }).filter(Boolean).sort((a, b) => a.cheapest.total - b.cheapest.total);
+}
+
+function weekCostHtml() {
+  const rows = weekCosts();
+  if (!rows.length) return '';
+  return `<h2>Cost this week</h2>
+    <p>Cheapest at <strong>${storeOf(rows[0].store).label}</strong>: about ${money(rows[0].cheapest.total)} for the amounts your meals use
+    (${money(rows[0].brand.total)} with big-name brands).</p>
+    ${costTable(rows)}`;
 }
 
 function refreshCosts() {
@@ -153,9 +202,18 @@ function refreshCosts() {
     const text = r && costText(r, +el.dataset.portions);
     if (text && text !== el.textContent) { el.textContent = text; el.classList.toggle('real', text.startsWith('~')); }
   });
+  const status = view.querySelector('#price-status');
+  if (status) status.textContent = priceStatus();
   const week = view.querySelector('#week-cost');
-  if (week) { week.innerHTML = weekCostText(); week.hidden = !week.innerHTML; }
+  if (week) week.innerHTML = weekCostHtml();
+  const rc = view.querySelector('#recipe-costs');
+  if (rc) rc.innerHTML = recipeCostHtml(getRecipe(rc.dataset.recipe), +rc.dataset.portions);
 }
+
+const priceStatus = () => (pricesPending() > 3 ? `· loading shop prices (${pricesPending()} to go)` : '');
+
+// Price every recipe's ingredients in the background, after the ones on screen, so all cards show a real cost.
+const preloadPrices = () => priceInBackground(unpriced(allCandidates()), refreshCosts, { later: true });
 
 // Ask for prices of the ingredients in these recipes (looked up slowly in the background).
 const priceRecipes = (recipes) => priceInBackground(unpriced(recipes.filter(Boolean)), refreshCosts);
@@ -192,6 +250,7 @@ async function topUpFromMealDb(force = false) {
     let found = term ? await fetchByIngredient(term, { limit: 8, skip }) : [];
     if (found.length < 3) found = found.concat(await fetchRandomRecipes(8));
     addFetched(found);
+    preloadPrices();
   } catch { /* offline or API busy - built-ins still work */ }
   fetching = false;
   const after = deck().length;
@@ -271,7 +330,7 @@ function goalsScreen() {
       <div class="option-grid">
         ${GOALS.map((g) => `
           <button class="option ${state.goals.includes(g.id) ? 'on' : ''}" data-goal="${g.id}">
-            <span class="option-emoji">${g.emoji}</span>
+            <span class="option-icon">${icon(g.icon)}</span>
             <span class="option-label">${g.label}</span>
             <span class="option-hint">${g.hint}</span>
           </button>`).join('')}
@@ -316,7 +375,7 @@ function baseScreen() {
       <div class="option-grid">
         ${BASES.map((b) => `
           <button class="option ${state.bases.includes(b.id) ? 'on' : ''}" data-base="${b.id}">
-            <span class="option-emoji">${b.emoji}</span>
+            <span class="option-icon">${icon(b.icon)}</span>
             <span class="option-label">${b.label}</span>
           </button>`).join('')}
       </div>
@@ -342,9 +401,9 @@ function limitsScreen() {
       <div class="chips">
         ${ALLERGENS.map((a) => `<button class="chip ${state.allergies.includes(a.id) ? 'on warn' : ''}" data-allergy="${a.id}">${a.label}</button>`).join('')}
       </div>
-      <h2>❤️ I like… <small>recipes with these come first</small></h2>
+      <h2>I like… <small>recipes with these come first</small></h2>
       ${foodPicker('likes', state.likes, FOODS, { placeholder: 'Add a food you love, e.g. halloumi' })}
-      <h2>👎 I don't like… <small>recipes with these are hidden</small></h2>
+      <h2>I don't like… <small>recipes with these are hidden</small></h2>
       ${foodPicker('dislikes', state.dislikes, FOODS, { placeholder: 'Add a food you don\'t eat, e.g. olives', cls: 'on warn' })}
       <h2>Diet</h2>
       <div class="chips">
@@ -386,18 +445,18 @@ function kitchenScreen() {
       <h1>${onboarding ? 'What\'s in your kitchen?' : 'My kitchen'}</h1>
       <p class="sub">Recipes that use what you already have are shown first, and anything you have is taken off your shopping list.</p>
       <div class="card-block kitchen-card useup">
-        <h2>⏰ Use these up <small>${state.pantry.useUp.length}</small></h2>
+        <h2>Use these up <small>${state.pantry.useUp.length}</small></h2>
         <p class="hint">Food that needs using soon. Recipes that use it get the biggest boost.</p>
         ${foodPicker('useUp', state.pantry.useUp, USE_UP_SUGGESTIONS, { placeholder: 'e.g. half a bag of spinach', cls: 'on amber' })}
       </div>
       <div class="card-block kitchen-card">
-        <h2>🧊 Everything I have <small>${state.pantry.have.length}</small></h2>
+        <h2>Everything I have <small>${state.pantry.have.length}</small></h2>
         <p class="hint">What's already in your fridge, freezer and cupboards. Add several at once, separated by commas.</p>
         ${foodPicker('have', state.pantry.have, HAVE_SUGGESTIONS, { placeholder: 'e.g. rice, onions, chopped tomatoes' })}
       </div>
       <div class="actions">
         ${onboarding ? '<button class="btn ghost" id="back">Back</button>' : '<button class="btn ghost" id="clear">Clear both lists</button>'}
-        <button class="btn primary big" id="next">${onboarding ? 'Start swiping 🔥' : 'Find recipes that use these'}</button>
+        <button class="btn primary big" id="next">${onboarding ? 'Start swiping' : 'Find recipes that use these'}</button>
       </div>
     </section>`;
   const keepScroll = () => { const y = window.scrollY; kitchenScreen(); window.scrollTo(0, y); };
@@ -417,30 +476,30 @@ let dragging = false;
 function cardHtml(r, top, planned) {
   const f = fit(r, planned);
   const meta = [
-    r.time ? `⏱ ~${r.time} min` : '',
+    r.time ? `~${r.time} min` : '',
     costHtml(r, state.people),
-    r.diet !== 'meat' ? `🌱 ${r.diet}` : '',
+    r.diet !== 'meat' ? `${r.diet}` : '',
   ].filter(Boolean);
   const base = BASES.find((b) => b.id === r.base);
   const goalTags = GOALS.filter((g) => r.tags.includes(g.id)).slice(0, 2);
   const badges = [
-    f.useUp.length ? `<div class="badge useup">⏰ Uses up your ${esc(f.useUp.slice(0, 3).join(', '))}</div>` : '',
-    f.have.length ? `<div class="badge have">🧊 Uses ${f.have.length} thing${f.have.length > 1 ? 's' : ''} you have: ${esc(f.have.slice(0, 3).join(', '))}</div>` : '',
-    f.fromPlan.length ? `<div class="badge reuse">♻️ Reuses ${f.fromPlan.length} from your week: ${esc(f.fromPlan.slice(0, 3).join(', '))}</div>` : '',
-    f.liked.length ? `<div class="badge like">❤️ Has ${esc(f.liked.map(foodLabel).join(', '))}</div>` : '',
+    f.useUp.length ? `<div class="badge useup">Uses up your ${esc(f.useUp.slice(0, 3).join(', '))}</div>` : '',
+    f.have.length ? `<div class="badge have">Uses ${f.have.length} thing${f.have.length > 1 ? 's' : ''} you have: ${esc(f.have.slice(0, 3).join(', '))}</div>` : '',
+    f.fromPlan.length ? `<div class="badge reuse">Reuses ${f.fromPlan.length} from your week: ${esc(f.fromPlan.slice(0, 3).join(', '))}</div>` : '',
+    f.liked.length ? `<div class="badge like">Has ${esc(f.liked.map(foodLabel).join(', '))}</div>` : '',
   ].filter(Boolean).slice(0, 2);
   return `
     <article class="swipe-card ${top ? 'top' : 'next'}" data-id="${esc(r.id)}">
       ${recipeArt(r)}
       <div class="stamp like">YUM</div>
       <div class="stamp nope">NOPE</div>
-      <div class="buy-count" title="New things to buy">🛒 ${f.toBuy.length} new to buy</div>
+      <div class="buy-count" title="New things to buy">${f.toBuy.length} new to buy</div>
       <div class="card-body">
         <h2>${esc(r.title)}</h2>
         <div class="meta">${meta.map((m) => `<span>${m}</span>`).join('')}</div>
         <div class="tags">
-          ${base && base.id !== 'none' ? `<span class="tag">${base.emoji} ${base.label}</span>` : ''}
-          ${goalTags.map((g) => `<span class="tag">${g.emoji} ${g.label}</span>`).join('')}
+          ${base && base.id !== 'none' ? `<span class="tag">${base.label}</span>` : ''}
+          ${goalTags.map((g) => `<span class="tag">${g.label}</span>`).join('')}
         </div>
         ${badges.join('')}
       </div>
@@ -451,13 +510,13 @@ function cardHtml(r, top, planned) {
 function prefsBar() {
   const chip = (cls, text) => `<span class="pref ${cls}">${esc(text)}</span>`;
   const chips = [
-    ...GOALS.filter((g) => state.goals.includes(g.id)).map((g) => chip('goal', `${g.emoji} ${g.label}`)),
-    ...BASES.filter((b) => state.bases.includes(b.id)).map((b) => chip('base', `${b.emoji} ${b.label}`)),
-    ...ALLERGENS.filter((a) => state.allergies.includes(a.id)).map((a) => chip('allergy', `⚠️ No ${a.label.toLowerCase()}`)),
-    ...DIETS.filter((d) => state.diets.includes(d.id)).map((d) => chip('diet', `🌱 ${d.label}`)),
-    ...state.likes.map((t) => chip('like', `❤️ ${foodLabel(t)}`)),
-    ...state.dislikes.map((t) => chip('dislike', `👎 ${foodLabel(t)}`)),
-    ...(state.pantry.useUp.length ? [chip('useup', `⏰ Use up ${state.pantry.useUp.length}`)] : []),
+    ...GOALS.filter((g) => state.goals.includes(g.id)).map((g) => chip('goal', g.label)),
+    ...BASES.filter((b) => state.bases.includes(b.id)).map((b) => chip('base', b.label)),
+    ...ALLERGENS.filter((a) => state.allergies.includes(a.id)).map((a) => chip('allergy', `No ${a.label.toLowerCase()}`)),
+    ...DIETS.filter((d) => state.diets.includes(d.id)).map((d) => chip('diet', `${d.label}`)),
+    ...state.likes.map((t) => chip('like', `Likes ${foodLabel(t).toLowerCase()}`)),
+    ...state.dislikes.map((t) => chip('dislike', `No ${foodLabel(t).toLowerCase()}`)),
+    ...(state.pantry.useUp.length ? [chip('useup', `Use up ${state.pantry.useUp.length}`)] : []),
   ];
   // On phones the chips sit on one line that scrolls sideways, so the card still fits the screen.
   return `
@@ -476,14 +535,14 @@ function swipeScreen() {
     <section class="screen swipe-screen">
       ${prefsBar()}
       <div class="progress">
-        <div class="progress-text"><strong>${picked}</strong> of ${target} meals picked</div>
+        <div class="progress-text"><strong>${picked}</strong> of ${target} meals picked <small class="price-status" id="price-status">${priceStatus()}</small></div>
         <div class="bar"><span style="width:${Math.min(100, (picked / target) * 100)}%"></span></div>
       </div>
       <div class="deck">
         ${cards.length
           ? cards.slice(0, 2).reverse().map((r, idx, arr) => cardHtml(r, idx === arr.length - 1, planned)).join('')
           : `<div class="empty">
-              <div class="big-emoji">🍽️</div>
+
               <h2>${fetching ? 'Finding more recipes…' : 'You\'ve seen every matching recipe'}</h2>
               <p>Load more, or loosen your staples, likes and limits in Settings.</p>
               <button class="btn primary" id="more">Load more recipes</button>
@@ -586,7 +645,7 @@ function showDoneModal() {
   const modal = document.getElementById('modal');
   modal.innerHTML = `
     <div class="modal-card">
-      <div class="big-emoji">🎉</div>
+
       <h2>Your week is planned!</h2>
       <p>You picked ${state.cookCount} meals.${shared ? ` ${shared} ingredients are shared between them, so less goes to waste.` : ''}</p>
       <button class="btn primary big" id="m-list">See my shopping list</button>
@@ -620,11 +679,13 @@ function recipeScreen(id) {
       <h1>${esc(r.title)}</h1>
       ${r.desc ? `<p class="sub">${esc(r.desc)}</p>` : ''}
       <div class="meta">
-        ${r.time ? `<span>⏱ ~${r.time} min</span>` : ''}
+        ${r.time ? `<span>~${r.time} min</span>` : ''}
         ${costHtml(r, portions)}
-        <span>🍽 ${portions} portion${portions > 1 ? 's' : ''}</span>
+        <span>${portions} portion${portions > 1 ? 's' : ''}</span>
       </div>
-      ${allergenLabels.length ? `<p class="allergens">⚠️ May contain: ${allergenLabels.join(', ')}. This is detected automatically, so always check the labels.</p>` : ''}
+      ${allergenLabels.length ? `<p class="allergens">May contain: ${allergenLabels.join(', ')}. This is detected automatically, so always check the labels.</p>` : ''}
+      <h2>Cost by shop</h2>
+      <div id="recipe-costs" data-recipe="${esc(r.id)}" data-portions="${portions}">${recipeCostHtml(r, portions)}</div>
       <h2>Ingredients</h2>
       <ul class="ingredients">${ingredientRows(r, factor)}</ul>
       <h2>Method</h2>
@@ -659,8 +720,7 @@ function planScreen() {
     <section class="screen">
       <h1>My week</h1>
       <p class="sub">${recipes.length} of ${state.cookCount} meals picked · cooking for ${state.people}</p>
-      <p class="badge week-cost block" id="week-cost" ${weekCostText() ? '' : 'hidden'}>${weekCostText()}</p>
-      ${shared.length ? `<div class="badge reuse block">♻️ <strong>${shared.length}</strong> ingredients are used in more than one meal: ${esc(shared.slice(0, 6).map((s) => s.name).join(', '))}${shared.length > 6 ? '…' : ''}</div>` : ''}
+      ${shared.length ? `<div class="badge reuse block"><strong>${shared.length}</strong> ingredients are used in more than one meal: ${esc(shared.slice(0, 6).map((s) => s.name).join(', '))}${shared.length > 6 ? '…' : ''}</div>` : ''}
       ${recipes.length ? `<ul class="plan-list">
         ${recipes.map((r) => `
           <li class="plan-item">
@@ -675,12 +735,13 @@ function planScreen() {
             </div>
             <button class="remove" data-remove="${esc(r.id)}" aria-label="Remove">✕</button>
           </li>`).join('')}
-      </ul>` : '<div class="empty"><div class="big-emoji">🫙</div><p>No meals yet. Go and swipe some!</p></div>'}
+      </ul>` : '<div class="empty"><p>No meals yet. Go and swipe some!</p></div>'}
+      <div id="week-cost">${weekCostHtml()}</div>
       <div class="actions">
         <button class="btn ghost" id="swipe">${recipes.length < state.cookCount ? 'Find more meals' : 'Keep swiping'}</button>
         ${recipes.length ? '<button class="btn primary big" id="list">Shopping list</button>' : ''}
       </div>
-      <p class="center"><button class="btn ghost sm" id="new-week">🔄 Start a new week</button></p>
+      <p class="center"><button class="btn ghost sm" id="new-week">Start a new week</button></p>
     </section>`;
   priceRecipes(recipes);
   view.querySelector('#new-week').addEventListener('click', () => {
@@ -704,7 +765,7 @@ function planScreen() {
 
 // ---------- shopping list ----------
 
-const OWNED = { id: 'owned', label: 'Already in your kitchen', emoji: '🧊' };
+const OWNED = { id: 'owned', label: 'Already in your kitchen' };
 
 function listItemHtml(it) {
   const store = storeOf(it.store);
@@ -716,7 +777,7 @@ function listItemHtml(it) {
         <span class="item-text">
           <span class="item-name">${esc(it.name)}</span>
           ${it.amount ? `<span class="item-amt">${esc(it.amount)}</span>` : ''}
-          ${it.from.length > 1 ? `<span class="item-shared">♻️ ${it.from.length}</span>` : ''}
+          ${it.from.length > 1 ? `<span class="item-shared">${it.from.length}</span>` : ''}
         </span>
       </label>
       ${it.from.length ? `
@@ -738,8 +799,8 @@ function listScreen() {
   const toBuy = items.filter((it) => !it.owned);
   const byStore = state.listGroup === 'store';
   const groups = byStore
-    ? STORES.map((s) => ({ id: s.id, label: s.label, emoji: '🏪', items: toBuy.filter((it) => it.store === s.id && it.cat !== 'staple') }))
-      .concat([{ id: 'staple', label: 'Check you have', emoji: '🧂', items: toBuy.filter((it) => it.cat === 'staple') }])
+    ? STORES.map((s) => ({ id: s.id, label: s.label, items: toBuy.filter((it) => it.store === s.id && it.cat !== 'staple') }))
+      .concat([{ id: 'staple', label: 'Check you have', items: toBuy.filter((it) => it.cat === 'staple') }])
     : CATEGORIES.map((c) => ({ ...c, items: toBuy.filter((it) => it.cat === c.id) }));
   groups.push({ ...OWNED, items: items.filter((it) => it.owned) });
   const left = toBuy.filter((it) => !it.checked && it.cat !== 'staple').length;
@@ -755,14 +816,14 @@ function listScreen() {
           <button class="${byStore ? '' : 'on'}" data-group="aisle">By aisle</button>
           <button class="${byStore ? 'on' : ''}" data-group="store">By shop</button>
         </div>
-        <span><a class="btn ghost sm" href="#/deals">🔔 Watch</a><button class="btn ghost sm" id="share">Share</button></span>
+        <span><a class="btn ghost sm" href="#/deals">Watch</a><button class="btn ghost sm" id="share">Share</button></span>
       </div>
       <form class="add-item" id="add">
         <input class="input" name="item" placeholder="Add something else, e.g. toilet roll" autocomplete="off">
         <button class="btn primary" type="submit">Add</button>
       </form>
       ${groups.filter((g) => g.items.length).map((g) => `
-        <h2 class="group-title">${g.emoji} ${esc(g.label)} <small>${g.items.length}</small></h2>
+        <h2 class="group-title">${esc(g.label)} <small>${g.items.length}</small></h2>
         ${g.id === 'owned' ? '<p class="hint">These match your <a href="#/kitchen">kitchen</a>, so you don\'t need to buy them. Tick them off as you check.</p>' : ''}
         <ul class="shop-list">${g.items.map(listItemHtml).join('')}</ul>`).join('')}
       ${items.some((it) => it.checked) ? '<div class="actions"><button class="btn ghost" id="clear">Untick everything</button></div>' : ''}
@@ -770,7 +831,7 @@ function listScreen() {
       ${toBuy.length && pricesEnabled() ? `<section class="brand-section" id="brands">${brandSectionHtml(toBuy)}</section>` : ''}
       ${toBuy.length ? `<section class="delivery-section" id="delivery">${deliveryHtml(toBuy)}</section>` : ''}
       ${recipes.length ? `
-        <h2 class="section-title">👩‍🍳 How to cook your meals</h2>
+        <h2 class="section-title">How to cook your meals</h2>
         ${recipes.map((r) => `
           <details class="howto">
             <summary>${recipeArt(r, 'thumb')}<span><strong>${esc(r.title)}</strong><small>${portionsFor(r.id)} portions${r.time ? ` · ~${r.time} min` : ''}</small></span></summary>
@@ -828,7 +889,7 @@ async function shareList(items) {
     const store = it.store ? ` [${storeOf(it.store).short}]` : '';
     return `☐ ${it.name}${it.amount ? ` (${it.amount})` : ''}${store}`;
   });
-  const text = `🛒 Shopping list\n\n${lines.join('\n')}`;
+  const text = `Shopping list\n\n${lines.join('\n')}`;
   try {
     if (navigator.share) await navigator.share({ title: 'Shopping list', text });
     else { await navigator.clipboard.writeText(text); toast('List copied to clipboard'); }
@@ -840,7 +901,7 @@ async function shareList(items) {
 const priceable = (items) => items.filter((it) => it.cat !== 'staple');
 
 function priceSectionHtml(items) {
-  const header = '<h2 class="section-title">💶 Price comparison</h2>';
+  const header = '<h2 class="section-title">Price comparison</h2>';
   if (!pricesEnabled()) {
     return `${header}
       <div class="card-block">
@@ -869,12 +930,13 @@ function priceSectionHtml(items) {
           <span class="store-name">${c.short}</span>
           <strong>${money(t.total)}</strong>
           <small>${t.found} of ${list.length} items</small>
+          ${t.brand - t.total >= 0.1 ? `<small class="brand-total">Big brands ${money(t.brand)}</small>` : ''}
           ${nearestKm(c.id)}
           ${c.id === sum.best ? '<span class="best-tag">Best value</span>' : ''}
         </div>`;
       }).join('')}
     </div>
-    ${sum.mixFound ? `<p class="mix">🧠 Cheapest if you split your shop: <strong>${money(sum.mix)}</strong> for ${sum.mixFound} items.</p>` : ''}
+    ${sum.mixFound ? `<p class="mix">Cheapest if you split your shop: <strong>${money(sum.mix)}</strong> for ${sum.mixFound} items.</p>` : ''}
     <div class="price-table-wrap">
       <table class="price-table">
         <thead><tr><th>Item</th>${CHAINS.map((c) => `<th style="--store:${c.color}">${c.short}</th>`).join('')}</tr></thead>
@@ -897,7 +959,7 @@ function priceSectionHtml(items) {
       <button class="btn ghost sm" id="refresh-prices">Refresh prices</button>
       <button class="btn primary" id="flag-cheapest">Flag items with the cheapest shop</button>
     </div>
-    <p class="hint">Online shelf prices from <a href="https://basketwatchireland.com" target="_blank" rel="noopener">BasketWatch Ireland</a>, collected each morning. Each price is what you would pay for the amount your meals need: enough packs to cover it, or loose fruit and veg by the piece or by weight. In-store prices and loyalty deals can differ. Tap a price to see the product.${Object.keys(state.nearest).length ? '' : ' <a href="#/shops">Find your nearest shops</a> to see distances.'}</p>`;
+    <p class="hint">Online shelf prices from <a href="https://basketwatchireland.com" target="_blank" rel="noopener">BasketWatch Ireland</a>, collected each morning. Each price is what you would pay for the amount your meals need: enough packs to cover it, or loose fruit and veg by the piece or by weight. "Big brands" is the same list buying the cheapest named brand of each item instead. In-store prices and loyalty deals can differ. Tap a price to see the product.${Object.keys(state.nearest).length ? '' : ' <a href="#/shops">Find your nearest shops</a> to see distances.'}</p>`;
 }
 
 function bindPriceSection(items) {
@@ -965,7 +1027,7 @@ function brandSectionHtml(items) {
   const brands = cachedPrices(list) ? cachedBrands(list) : null;
   const rows = brands ? list.filter((it) => (brands[it.key] || []).length > 1) : [];
   return `
-    <h2 class="section-title">🏷️ Brand check</h2>
+    <h2 class="section-title">Brand check</h2>
     <p class="hint">Own-brand vs big brands (Barilla, Green Giant, Heinz…), compared per kg or litre so pack sizes are fair.</p>
     <form class="add-item" id="brand-search">
       <input class="input" name="q" placeholder="Check any product, e.g. frozen sweetcorn" autocomplete="off">
@@ -1036,9 +1098,9 @@ function deliveryHtml(items) {
   const cheapest = options[0];
 
   return `
-    <h2 class="section-title">🚚 Delivery calculator</h2>
+    <h2 class="section-title">Delivery calculator</h2>
     <div class="card-block calc">
-      <h3>🛵 Cook it yourself vs. order takeaway</h3>
+      <h3>Cook it yourself vs. order takeaway</h3>
       <p class="hint">What your ${meals} meal${meals === 1 ? '' : 's'} (${portions} portions) would cost on Uber Eats, Deliveroo, Just Eat or DoorDash/Wolt. Change the numbers to match what you usually pay.</p>
       <div class="calc-grid">
         <label>Takeaway main, per person ${numberInput('takeawayMeal', d.takeawayMeal)}</label>
@@ -1053,13 +1115,13 @@ function deliveryHtml(items) {
         <div class="home"><small>Cooking at home${sum?.best ? ` (${storeOf(sum.best).short})` : ''}</small><strong>${money(home)}</strong><small>${money(portions ? home / portions : 0)} a portion</small></div>
       </div>
       ${meals ? `<p class="saving ${saved > 0 ? '' : 'neg'}">${saved > 0
-        ? `💰 Cooking saves you about <strong>${money(saved)}</strong> this week (${money(saved * 52)} a year).`
+        ? `Cooking saves you about <strong>${money(saved)}</strong> this week (${money(saved * 52)} a year).`
         : 'Takeaway works out cheaper with these numbers. Check your estimates!'}</p>` : '<p class="hint">Pick some meals to compare.</p>'}
       ${sum?.best ? '<p class="hint">Your grocery cost is the best-value shop from the price comparison above, so it includes everything on your list.</p>' : ''}
     </div>
 
     <div class="card-block calc">
-      <h3>🛒 Grocery delivery vs. going to the shop</h3>
+      <h3>Grocery delivery vs. going to the shop</h3>
       <p class="hint">Enter each chain's delivery fee for your slot (leave it blank if they don't deliver to you). Driving costs ${numberInput('perKm', d.perKm, { step: 0.05 })} € per km, there and back.</p>
       <div class="price-table-wrap">
         <table class="price-table calc-table">
@@ -1075,7 +1137,7 @@ function deliveryHtml(items) {
           </tbody>
         </table>
       </div>
-      ${cheapest ? `<p class="saving">🏆 Cheapest way to get your shopping: <strong>${esc(cheapest.label)}</strong> at ${money(cheapest.cost)}.</p>` : ''}
+      ${cheapest ? `<p class="saving">Cheapest way to get your shopping: <strong>${esc(cheapest.label)}</strong> at ${money(cheapest.cost)}.</p>` : ''}
       <p class="hint">${sum ? '' : 'Run the price comparison above to fill in each shop\'s basket. '}${Object.keys(state.nearest).length ? '' : '<a href="#/shops">Find your nearest shops</a> to work out the in-store driving cost. '}Delivery fees, minimum spends and app fees vary by area, time slot and offer, so check them when you order.</p>
     </div>`;
 }
@@ -1104,7 +1166,7 @@ function shopsScreen() {
       <h1>Nearest shops</h1>
       <p class="sub">How far your nearest Tesco, Dunnes, SuperValu, Aldi and Lidl are.</p>
       <div class="card-block">
-        <button class="btn primary" id="locate">📍 Use my location</button>
+        <button class="btn primary" id="locate">Use my location</button>
         <form class="add-item" id="place">
           <input class="input" name="q" placeholder="Or type a town or Eircode" autocomplete="off" value="">
           <button class="btn" type="submit">Search</button>
@@ -1235,7 +1297,7 @@ async function runWatchCheck() {
   state.watchCheckedAt = Date.now();
   save();
   if (['deals', 'list'].includes(currentRoute())) render();
-  else if (alerts.length) toast(`🔔 ${alerts.length} price drop${alerts.length > 1 ? 's' : ''} on things you buy - see your list`);
+  else if (alerts.length) toast(`${alerts.length} price drop${alerts.length > 1 ? 's' : ''} on things you buy - see your list`);
 }
 
 function autoCheckWatch() {
@@ -1259,7 +1321,7 @@ function alertHtml(a) {
 function alertBanner() {
   if (!state.alerts.length || !pricesEnabled()) return '';
   const n = state.alerts.length;
-  return `<a class="badge alert-banner block" href="#/deals">🔔 ${n} thing${n > 1 ? 's' : ''} you buy ${n > 1 ? 'are' : 'is'} cheaper or on offer this week ›</a>`;
+  return `<a class="badge alert-banner block" href="#/deals">${n} thing${n > 1 ? 's' : ''} you buy ${n > 1 ? 'are' : 'is'} cheaper or on offer this week ›</a>`;
 }
 
 function dealsScreen() {
@@ -1267,7 +1329,7 @@ function dealsScreen() {
   const checked = state.watchCheckedAt ? new Date(state.watchCheckedAt).toLocaleDateString('en-IE', { weekday: 'long', day: 'numeric', month: 'short' }) : '';
   view.innerHTML = `
     <section class="screen">
-      <h1>🔔 Price watch</h1>
+      <h1>Price watch</h1>
       <p class="sub">Once a week, when you open the app, we re-check the prices of things you buy often and show what's cheaper or on special offer. Anything you tick off your shopping list on two shopping trips is watched automatically.</p>
       ${pricesEnabled() ? '' : '<p class="error">Shop prices aren\'t switched on, so the price watch can\'t run.</p>'}
       ${state.alerts.length ? `<h2>This week</h2><ul class="alert-list">${state.alerts.map(alertHtml).join('')}</ul>` : ''}
@@ -1331,9 +1393,9 @@ function settingsScreen() {
       <h2>Account &amp; sync</h2>
       <div class="card-block">
         ${!sync.isConfigured()
-          ? '<p>📱 Your data is saved on this device. Cloud sync with Google sign-in can be turned on later (see the README).</p>'
+          ? '<p>Your data is saved on this device. Cloud sync with Google sign-in can be turned on later (see the README).</p>'
           : user
-            ? `<p>✅ Signed in as <strong>${esc(user.email)}</strong>. Your plan syncs across devices.</p><button class="btn ghost" id="signout">Sign out</button>`
+            ? `<p>Signed in as <strong>${esc(user.email)}</strong>. Your plan syncs across devices.</p><button class="btn ghost" id="signout">Sign out</button>`
             : '<p>Sign in to sync your list and plan across your devices.</p><button class="btn google" id="signin"><span>G</span> Sign in with Google</button>'}
       </div>
       <h2>Your preferences</h2>
@@ -1419,6 +1481,7 @@ document.addEventListener('keydown', (e) => {
 
 render();
 setTimeout(autoCheckWatch, 3000); // weekly price watch, once the first screen is up
+setTimeout(preloadPrices, 1500);
 sync.initSync(render);
 
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {

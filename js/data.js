@@ -1,24 +1,24 @@
 // Option lists used across the app.
 
 export const GOALS = [
-  { id: 'money',    emoji: '💶', label: 'Save money',         hint: 'Cheaper ingredients, fewer extras' },
-  { id: 'healthy',  emoji: '🥦', label: 'Eat healthier',      hint: 'More veg, lighter meals' },
-  { id: 'mealprep', emoji: '🍱', label: 'Easy meal prep',     hint: 'Batch-cook once, eat all week' },
-  { id: 'waste',    emoji: '♻️', label: 'Waste less food',    hint: 'Recipes that share ingredients' },
-  { id: 'quick',    emoji: '⚡', label: 'Quick meals',        hint: '30 minutes or less' },
-  { id: 'protein',  emoji: '💪', label: 'More protein',       hint: 'Filling, high-protein meals' },
-  { id: 'family',   emoji: '👨‍👩‍👧', label: 'Family friendly',    hint: 'Crowd-pleasers for all ages' },
+  { id: 'money',    icon: 'money', label: 'Save money',         hint: 'Cheaper ingredients, fewer extras' },
+  { id: 'healthy',  icon: 'healthy', label: 'Eat healthier',      hint: 'More veg, lighter meals' },
+  { id: 'mealprep', icon: 'mealprep', label: 'Easy meal prep',     hint: 'Batch-cook once, eat all week' },
+  { id: 'waste',    icon: 'waste', label: 'Waste less food',    hint: 'Recipes that share ingredients' },
+  { id: 'quick',    icon: 'quick', label: 'Quick meals',        hint: '30 minutes or less' },
+  { id: 'protein',  icon: 'protein', label: 'More protein',       hint: 'Filling, high-protein meals' },
+  { id: 'family',   icon: 'family', label: 'Family friendly',    hint: 'Crowd-pleasers for all ages' },
 ];
 
 // The main staple a meal is built around. `fetch` = TheMealDB ingredient names used to find more recipes.
 export const BASES = [
-  { id: 'pasta',   emoji: '🍝', label: 'Pasta',          fetch: ['spaghetti', 'penne_rigate', 'macaroni', 'lasagne_sheets', 'farfalle'] },
-  { id: 'rice',    emoji: '🍚', label: 'Rice',           fetch: ['rice', 'basmati_rice'] },
-  { id: 'potato',  emoji: '🥔', label: 'Potatoes',       fetch: ['potatoes'] },
-  { id: 'noodles', emoji: '🍜', label: 'Noodles',        fetch: ['rice_noodles', 'noodles', 'egg_noodles'] },
-  { id: 'bread',   emoji: '🌯', label: 'Bread & wraps',  fetch: ['bread', 'tortillas', 'puff_pastry'] },
-  { id: 'grains',  emoji: '🌾', label: 'Couscous & grains', fetch: ['couscous', 'quinoa'] },
-  { id: 'none',    emoji: '🥘', label: 'Soups, stews & curries', fetch: [] },
+  { id: 'pasta',   icon: 'pasta', label: 'Pasta',          fetch: ['spaghetti', 'penne_rigate', 'macaroni', 'lasagne_sheets', 'farfalle'] },
+  { id: 'rice',    icon: 'rice', label: 'Rice',           fetch: ['rice', 'basmati_rice'] },
+  { id: 'potato',  icon: 'potato', label: 'Potatoes',       fetch: ['potatoes'] },
+  { id: 'noodles', icon: 'noodles', label: 'Noodles',        fetch: ['rice_noodles', 'noodles', 'egg_noodles'] },
+  { id: 'bread',   icon: 'bread', label: 'Bread & wraps',  fetch: ['bread', 'tortillas', 'puff_pastry'] },
+  { id: 'grains',  icon: 'grains', label: 'Couscous & grains', fetch: ['couscous', 'quinoa'] },
+  { id: 'none',    icon: 'stew', label: 'Soups, stews & curries', fetch: [] },
 ];
 
 // Quick picks for the "I like" / "I don't like" lists. `match` = words found in ingredient names.
@@ -76,15 +76,15 @@ export const TIMES = [
 
 // Shopping list aisles, in the order they appear in the list.
 export const CATEGORIES = [
-  { id: 'veg',    label: 'Fruit & veg',          emoji: '🥕' },
-  { id: 'meat',   label: 'Meat',                 emoji: '🥩' },
-  { id: 'fish',   label: 'Fish',                 emoji: '🐟' },
-  { id: 'dairy',  label: 'Dairy, eggs & chilled', emoji: '🧀' },
-  { id: 'bakery', label: 'Bakery',               emoji: '🍞' },
-  { id: 'frozen', label: 'Frozen',               emoji: '🧊' },
-  { id: 'pantry', label: 'Cupboard',             emoji: '🥫' },
-  { id: 'other',  label: 'Other',                emoji: '🛒' },
-  { id: 'staple', label: 'Check you have',       emoji: '🧂' },
+  { id: 'veg',    label: 'Fruit & veg' },
+  { id: 'meat',   label: 'Meat' },
+  { id: 'fish',   label: 'Fish' },
+  { id: 'dairy',  label: 'Dairy, eggs & chilled' },
+  { id: 'bakery', label: 'Bakery' },
+  { id: 'frozen', label: 'Frozen' },
+  { id: 'pantry', label: 'Cupboard' },
+  { id: 'other',  label: 'Other' },
+  { id: 'staple', label: 'Check you have' },
 ];
 
 // Chain stores that items can be flagged with. Prices come from BasketWatch Ireland (see prices.js);

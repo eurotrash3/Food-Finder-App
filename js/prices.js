@@ -5,7 +5,7 @@
 import { PRICES_URL } from './config.js';
 import { CHAINS } from './data.js';
 
-const CACHE_KEY = 'food-finder-prices-v3'; // v3: prices are the cost of the amount needed, not one pack
+const CACHE_KEY = 'food-finder-prices-v4'; // v4: adds big-brand prices; v3: cost of the amount needed, not one pack
 const today = () => new Date().toISOString().slice(0, 10);
 
 // Developers can point at a local relay: localStorage.setItem('ff-prices-url', 'http://localhost:8765/bw')
@@ -25,7 +25,10 @@ const QUERY = {
   'tomato purée': ['tomato puree', 'tomato paste'], 'dried oregano': 'oregano', chicken: 'chicken fillets', beef: 'diced beef',
   lamb: 'diced lamb', sugar: 'caster sugar', cornstarch: 'cornflour', 'bay leaf': 'bay leaves', mint: 'fresh mint',
   parmesan: ['parmesan', 'parmigiano reggiano'], 'black olive': 'black olives', avocado: 'avocados', 'egg yolk': 'eggs',
-  'egg white': 'eggs',
+  'egg white': 'eggs', shrimp: 'prawns', 'green red lentils': 'red lentils', 'cilantro leaves': 'coriander',
+  'thai fish sauce': 'fish sauce', hotsauce: 'hot sauce', 'chinese five spice powder': 'five spice', 'dry sherry': 'sherry',
+  'shredded monterey jack cheese': 'grated cheddar', 'shredded mexican cheese': 'grated cheddar', 'dry white wine': 'white wine',
+  'scotch bonnet': 'chillies', 'harissa spice': 'harissa', 'jerusalem artichoke': 'artichoke',
 };
 
 export const queriesFor = (name) => [].concat(QUERY[name] || name.normalize('NFD').replace(/[̀-ͯ]/g, ''));
@@ -153,16 +156,20 @@ export function pickPerStore(data, item) {
   const out = {};
   for (const chain of CHAINS) {
     let best = null;
+    let brand = null; // cheapest big-name brand, for the "big brands" comparison
     for (const match of data?.matches || []) {
       const p = match.stores?.[chain.id];
       if (!p || p.price == null || !relevant(p.name || match.display_name, item.name, item.query)) continue;
       const c = costOf(p, match, item, need);
       if (!best || c.cost < best.cost) best = { ...c, p };
+      if (!OWN_LABEL.test((match.brand || '').trim()) && (!brand || c.cost < brand.cost)) brand = { ...c, p };
     }
     if (!best) { out[chain.id] = null; continue; }
     const { p } = best;
+    const b = brand || best; // nothing branded (loose veg): same as the cheapest
     out[chain.id] = { price: Math.round(best.cost * 100) / 100, each: p.price, note: best.note, member: p.clubcard_price,
-      name: p.name, url: p.url, image: p.image_url, offer: p.offer_text, date: p.scrape_date };
+      name: p.name, url: p.url, image: p.image_url, offer: p.offer_text, date: p.scrape_date,
+      brandPrice: Math.round(b.cost * 100) / 100, brandName: b.p.name };
   }
   return out;
 }
@@ -303,7 +310,7 @@ export function clearPriceCache() {
 
 // Totals per store, plus the "cheapest mix" if you split the shop.
 export function summarize(items, results) {
-  const totals = Object.fromEntries(CHAINS.map((c) => [c.id, { total: 0, found: 0 }]));
+  const totals = Object.fromEntries(CHAINS.map((c) => [c.id, { total: 0, brand: 0, found: 0 }]));
   let mix = 0;
   let mixFound = 0;
   for (const it of items) {
@@ -314,6 +321,7 @@ export function summarize(items, results) {
       const p = r[c.id];
       if (!p) continue;
       totals[c.id].total += p.price;
+      totals[c.id].brand += p.brandPrice ?? p.price;
       totals[c.id].found += 1;
       if (min == null || p.price < min) min = p.price;
     }
@@ -337,14 +345,14 @@ export const cheapestStore = (r) => {
 // Each ingredient's price per gram (and per piece, and for a typical pack) is learned from BasketWatch a little at a
 // time and kept for a week, so cards can show "~€1.85 a portion" instead of a €/€€/€€€ guess.
 
-const UNIT_KEY = 'food-finder-unitprices-v1';
+const UNIT_KEY = 'food-finder-unitprices-v2'; // v2: prices per shop, cheapest and big-brand
 const UNIT_TTL = 7 * 24 * 3600 * 1000;
 const FAILED_TTL = 24 * 3600 * 1000;
 // Rough grams for kitchen measures.
 const MEASURE_GRAMS = { g: 1, ml: 1, tsp: 4, tbsp: 13, cup: 200, tin: 400, clove: 5 };
 const PIECE_GRAMS_EXTRA = { 'chicken breast': 150, 'chicken thigh': 120, sausage: 57, bacon: 25, 'salmon fillet': 120,
   'cod fillet': 120, 'pork chop': 180, 'lamb chop': 100, tortilla: 40, 'pitta bread': 60, 'king prawn': 15, prawn: 10,
-  'cherry tomato': 15, 'egg yolk': 60, 'egg white': 60, 'bay leaf': 0.2, thyme: 1, rosemary: 1, 'kaffir lime leaves': 0.2, 'lime leaf': 0.2 };
+  'cherry tomato': 15, 'egg yolk': 60, 'lamb kidney': 60, shallot: 40, 'egg white': 60, 'bay leaf': 0.2, thyme: 1, rosemary: 1, 'kaffir lime leaves': 0.2, 'lime leaf': 0.2 };
 
 function loadUnits() {
   try {
@@ -366,16 +374,17 @@ export function saveUnitPrice(name, up) {
   localStorage.setItem(UNIT_KEY, JSON.stringify(units));
 }
 
-// Each shop's cheapest price per gram, per piece and per pack for an ingredient. The estimate uses the
-// second-cheapest shop, so one odd match can't make a recipe look too cheap.
+// An ingredient's prices: per gram, per piece and per pack.
+//  - s[shop].c: the cheapest at that shop (usually its own brand), s[shop].b: the cheapest big-name brand there
+//  - perG/perPiece/pack: an all-shops estimate (the second-cheapest shop, so one odd match can't make a recipe
+//    look too cheap), used for ingredients a shop doesn't stock
 export function unitPriceOf(data, item) {
-  const perG = [];
-  const perPiece = [];
-  const pack = [];
+  const s = {};
+  const all = { g: [], pc: [], pk: [] };
+  const lower = (a, b) => (a == null ? b : b == null ? a : Math.min(a, b));
   for (const chain of CHAINS) {
-    let g = null;
-    let pc = null;
-    let pk = null;
+    const c = [null, null, null];
+    const b = [null, null, null];
     for (const match of data?.matches || []) {
       const p = match.stores?.[chain.id];
       if (!p || p.price == null || !relevant(p.name || match.display_name, item.name, item.query)) continue;
@@ -384,21 +393,35 @@ export function unitPriceOf(data, item) {
       const pieces = packPieces(p.name) || packPieces(match.pack);
       const pg = u && (u.basis === 'kg' || u.basis === 'l') ? u.value / 1000 : grams ? p.price / grams : null;
       const each = u?.basis === 'each' ? u.value : pieces ? p.price / pieces : null;
-      if (pg && (g == null || pg < g)) g = pg;
-      if (each && (pc == null || each < pc)) pc = each;
-      if (pk == null || p.price < pk) pk = p.price;
+      const vals = [pg, each, p.price];
+      for (let i = 0; i < 3; i++) c[i] = lower(c[i], vals[i]);
+      if (!OWN_LABEL.test((match.brand || '').trim())) for (let i = 0; i < 3; i++) b[i] = lower(b[i], vals[i]);
     }
-    if (g) perG.push(g);
-    if (pc) perPiece.push(pc);
-    if (pk) pack.push(pk);
+    if (c[2] == null) continue;
+    s[chain.id] = { c, b: b[2] == null ? null : b };
+    if (c[0]) all.g.push(c[0]);
+    if (c[1]) all.pc.push(c[1]);
+    all.pk.push(c[2]);
   }
   const pick = (a) => (a.length ? a.sort((x, y) => x - y)[Math.min(1, a.length - 1)] : null);
-  return { perG: pick(perG), perPiece: pick(perPiece), pack: pick(pack) };
+  return { perG: pick(all.g), perPiece: pick(all.pc), pack: pick(all.pk), s };
+}
+
+// Prices to use for an ingredient: the all-shops estimate, or one shop's cheapest / big-brand price.
+// null if unknown, or if `mode.store` doesn't stock it.
+function pricesFor(name, mode) {
+  const up = known(name) && unitCache()[name];
+  if (!up || !mode) return up || null;
+  const s = up.s?.[mode.store];
+  if (!s) return null;
+  const [perG, perPiece, pack] = (mode.brand && s.b) || s.c; // no big brand (loose veg): same as cheapest
+  return { perG, perPiece, pack };
 }
 
 // What one recipe ingredient costs at `factor` × the recipe's amounts (only the part used). null if unknown.
-export function ingredientCost(ing, factor) {
-  const up = known(ing.name) && unitCache()[ing.name];
+// `mode` = { store, brand } prices it at one shop; leave it out for the all-shops estimate.
+export function ingredientCost(ing, factor, mode) {
+  const up = pricesFor(ing.name, mode);
   if (!up) return null;
   const qty = ing.qty * factor;
   if (!ing.unit) { // counted: "2 onions", "1 bunch coriander"
@@ -416,45 +439,94 @@ export function ingredientCost(ing, factor) {
 
 const costed = (r) => r.ingredients.filter((i) => i.cat !== 'staple' && i.qty > 0);
 
-// { total, perPortion, coverage (0-1 of ingredients priced) } for `portions` portions, or null if prices are off.
-export function recipeCost(r, portions) {
+// { total, perPortion, coverage, stocked } for `portions` portions, or null if prices are off.
+//  coverage: share of the recipe (by weight) with any price; 0 if a meat or fish is unpriced (usually most of the cost)
+//  stocked: with `mode.store`, the share that shop sells; the rest is filled in with the all-shops estimate
+export function recipeCost(r, portions, mode) {
   if (!pricesEnabled()) return null;
   const list = costed(r);
   if (!list.length) return null;
   const factor = portions / (r.serves || 4);
   let total = 0.15 * portions; // oil, salt, pepper and the like
-  // Coverage is by weight, so a missing 800 g of beef counts for more than a missing pinch of cinnamon,
-  // and is 0 if any meat or fish is unpriced (it's usually most of the cost).
   let all = 0;
   let priced = 0;
+  let atStore = 0;
   let mainMissing = false;
   for (const ing of list) {
     const grams = ing.unit ? ing.qty * (MEASURE_GRAMS[ing.unit] || 5)
       : ing.qty * (PIECE_GRAMS[ing.name] || PIECE_GRAMS_EXTRA[ing.name] || 50);
-    const c = ingredientCost(ing, factor);
     all += grams;
+    let c = mode ? ingredientCost(ing, factor, mode) : null;
+    if (c != null) atStore += grams;
+    else c = ingredientCost(ing, factor);
     if (c != null) { total += c; priced += grams; } else if (ing.cat === 'meat' || ing.cat === 'fish') mainMissing = true;
   }
-  return { total, perPortion: total / portions, coverage: mainMissing || !all ? 0 : priced / all };
+  return { total, perPortion: total / portions, coverage: mainMissing || !all ? 0 : priced / all,
+    stocked: mode && all ? atStore / all : 1 };
+}
+
+// Cost at each shop: its cheapest options, and with big-name brands. Only shops that sell most of the recipe
+// (70%+ by weight), cheapest first. [] until the recipe is priced.
+export function storeCosts(r, portions) {
+  const any = recipeCost(r, portions);
+  if (!any || any.coverage < 0.75) return [];
+  return CHAINS.map((chain) => ({
+    store: chain.id,
+    cheapest: recipeCost(r, portions, { store: chain.id }),
+    brand: recipeCost(r, portions, { store: chain.id, brand: true }),
+  })).filter((x) => x.cheapest.stocked >= 0.7).sort((a, b) => a.cheapest.total - b.cheapest.total);
 }
 
 // Ingredients of these recipes that have no price yet.
 export const unpriced = (recipes) => [...new Set(recipes.flatMap(costed).map((i) => i.name))].filter((n) => !known(n));
 
+// If nothing matches "feather blade beef" or "sherry vinegar", a simpler search for its last word ("beef",
+// "vinegar") gives a fair estimate. Not for words that mean nothing alone ("lasagne sheet" -> "sheet").
+const VAGUE = ['sheet', 'leaf', 'leaves', 'powder', 'sauce', 'paste', 'fillet', 'breast', 'seed', 'seeds', 'stock', 'juice',
+  'oil', 'piece', 'pieces', 'mix', 'frai', 'cheese', 'flakes', 'zest'];
+export function fallbackName(name) {
+  const words = name.split(' ');
+  const last = words[words.length - 1];
+  return words.length > 1 && last.length > 3 && !VAGUE.includes(last) ? last : null;
+}
+
+// Learns an ingredient's prices. `fetchData(query)` returns BasketWatch results (the relay, or saved files in tests).
+export async function priceIngredient(name, fetchData) {
+  const tryName = async (n) => {
+    const query = queriesFor(n);
+    const data = mergeResults(await Promise.all(query.map(fetchData)));
+    return { up: unitPriceOf(data, { name: n, query }), searches: query.length };
+  };
+  let { up, searches } = await tryName(name);
+  const simpler = fallbackName(name);
+  if (!up.perG && !up.perPiece && !up.pack && simpler) {
+    const more = await tryName(simpler);
+    up = more.up;
+    searches += more.searches;
+  }
+  saveUnitPrice(name, up);
+  return searches;
+}
+
 // Background pricing: looks up one ingredient every few seconds (BasketWatch rate-limits bursts) while the
-// app is open, then calls `onPriced(name)`. Newer requests go to the front of the queue.
+// app is open, then calls `onPriced(name)`. Newer requests go to the front of the queue; `later` ones
+// (preloading every recipe) go to the back.
 const pending = [];
 let pricing = false;
-export function priceInBackground(names, onPriced) {
+export function priceInBackground(names, onPriced, { later = false } = {}) {
   if (!pricesEnabled()) return;
-  for (const n of [...names].reverse()) {
+  for (const n of later ? names : [...names].reverse()) {
     const i = pending.indexOf(n);
-    if (i >= 0) pending.splice(i, 1);
-    if (!known(n)) pending.unshift(n);
+    if (i >= 0) { if (later) continue; pending.splice(i, 1); }
+    if (known(n)) continue;
+    if (later) pending.push(n); else pending.unshift(n);
   }
   priceInBackground.onPriced = onPriced;
   if (!pricing) runPricing();
 }
+
+// How many ingredients are still waiting to be priced.
+export const pricesPending = () => pending.length;
 
 async function runPricing() {
   pricing = true;
@@ -462,12 +534,10 @@ async function runPricing() {
     if (document.hidden || !navigator.onLine) { await wait(5000); continue; }
     const name = pending.shift();
     if (known(name)) continue;
-    const query = queriesFor(name);
     try {
-      const data = mergeResults(await Promise.all(query.map((q) => lookup(q, 2))));
-      saveUnitPrice(name, unitPriceOf(data, { name, query }));
+      const searches = await priceIngredient(name, (q) => lookup(q, 2));
       priceInBackground.onPriced?.(name);
-      await wait(3500 * query.length);
+      await wait(2500 * searches);
     } catch {
       failures[name] = (failures[name] || 0) + 1;
       if (failures[name] < 3) pending.push(name); // try again later
