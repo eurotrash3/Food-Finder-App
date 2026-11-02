@@ -242,7 +242,7 @@ main { max-width: 560px; margin: 0 auto; padding: 0 16px calc(var(--tabbar) + 40
 .item-name { font-weight: 600; }
 .item-name::first-letter { text-transform: uppercase; }
 .item-amt { color: var(--muted); font-size: .88rem; }
-.item-shared { font-size: .75rem; color: #8a5a00; background: #fff7e6; border-radius: 999px; padding: 1px 7px; }
+.item-store { font-size: .72rem; font-weight: 600; color: var(--store); border: 1px solid var(--store); border-radius: 999px; padding: 0 7px; }
 .shop-item.done .item-name, .shop-item.done .item-amt { text-decoration: line-through; color: #a5b0a8; }
 .store-pick {
   appearance: none; -webkit-appearance: none; border: 0; border-radius: 999px;
@@ -458,3 +458,11 @@ a.btn { text-decoration: none; display: inline-block; }
 .option-icon .icon { width: 30px; height: 30px; }
 .option.on .option-icon { color: var(--green-2); }
 .art .art-icon { width: 40%; height: 40%; color: rgba(255, 255, 255, .85); }
+
+/* Fold-up sections at the end of the shopping list */
+details.fold { border-top: 1px solid var(--line); margin-top: 1.4rem; }
+details.fold > summary { display: flex; align-items: center; cursor: pointer; list-style: none; padding: 4px 0; }
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary .section-title { margin: .8rem 0; }
+details.fold > summary::after { content: "▾"; margin-left: auto; color: var(--muted); transition: transform .2s; }
+details.fold[open] > summary::after { transform: rotate(180deg); }
